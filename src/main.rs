@@ -8,11 +8,11 @@ use relational_database_mcp::server::McpServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init()
-        .expect("failed to initialize tracing subscriber");
+    if let Err(e) =
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).try_init()
+    {
+        eprintln!("Warning: failed to initialize tracing subscriber ({e}), logging may not work");
+    }
 
     let args = Args::parse();
 
