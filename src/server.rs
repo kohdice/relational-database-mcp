@@ -20,7 +20,8 @@ use crate::error::sqlx_to_mcp_error;
 /// Queries returning more rows are truncated with a notification to the caller.
 const MAX_RESULT_ROWS: usize = 10_000;
 
-/// MCP server that exposes relational database operations as MCP tools and resources.
+/// Core handler implementing [`ServerHandler`] from `rmcp`, dispatching MCP tool calls
+/// to the underlying [`DatabaseConnection`].
 #[derive(Clone)]
 pub struct McpServer {
     db: DatabaseConnection,
@@ -56,6 +57,7 @@ impl McpServer {
 
 #[tool_router]
 impl McpServer {
+    /// Creates a new MCP server backed by the given database connection.
     pub fn new(db: DatabaseConnection) -> Self {
         Self { db, tool_router: Self::tool_router() }
     }
@@ -91,7 +93,7 @@ impl McpServer {
                 sqlx_to_mcp_error(e)
             })? {
                 rows.push(row);
-                if rows.len() > MAX_RESULT_ROWS {
+                if rows.len() >= MAX_RESULT_ROWS {
                     truncated = true;
                     break;
                 }
@@ -242,8 +244,16 @@ impl ServerHandler for McpServer {
     ) -> Result<ReadResourceResult, McpError> {
         let uri = &request.uri;
 
-        let raw_name =
+        let (scheme, raw_name) =
             parse_table_from_uri(uri).map_err(|e| McpError::resource_not_found(e, None))?;
+
+        let expected_scheme = self.db.db_type().resource_uri_scheme();
+        if scheme != expected_scheme {
+            return Err(McpError::resource_not_found(
+                format!("URI scheme '{scheme}' does not match expected '{expected_scheme}'"),
+                None,
+            ));
+        }
 
         let table_name = ValidatedTableName::new(&raw_name).map_err(|e| e.into_mcp_error())?;
 
@@ -264,10 +274,11 @@ impl ServerHandler for McpServer {
     }
 }
 
-/// Extracts a table name from a resource URI of the form `{scheme}://{table_name}/data`.
-/// Returns an error describing the specific parsing failure.
-fn parse_table_from_uri(uri: &str) -> Result<String, String> {
-    let (_, rest) = uri
+/// Extracts the scheme and table name from a resource URI of the form
+/// `{scheme}://{table_name}/data`. Returns `(scheme, table_name)` on success,
+/// or an error describing the specific parsing failure.
+fn parse_table_from_uri(uri: &str) -> Result<(String, String), String> {
+    let (scheme, rest) = uri
         .split_once("://")
         .ok_or_else(|| format!("URI missing '://' scheme separator: {uri}"))?;
     let table_name = rest
@@ -276,7 +287,7 @@ fn parse_table_from_uri(uri: &str) -> Result<String, String> {
     if table_name.is_empty() {
         return Err(format!("URI has empty table name: {uri}"));
     }
-    Ok(table_name.to_string())
+    Ok((scheme.to_string(), table_name.to_string()))
 }
 
 #[cfg(test)]
@@ -285,9 +296,18 @@ mod tests {
 
     #[test]
     fn test_parse_table_from_uri() {
-        assert_eq!(parse_table_from_uri("mysql://users/data"), Ok("users".to_string()));
-        assert_eq!(parse_table_from_uri("postgres://orders/data"), Ok("orders".to_string()));
-        assert_eq!(parse_table_from_uri("sqlite://items/data"), Ok("items".to_string()));
+        assert_eq!(
+            parse_table_from_uri("mysql://users/data"),
+            Ok(("mysql".to_string(), "users".to_string()))
+        );
+        assert_eq!(
+            parse_table_from_uri("postgres://orders/data"),
+            Ok(("postgres".to_string(), "orders".to_string()))
+        );
+        assert_eq!(
+            parse_table_from_uri("sqlite://items/data"),
+            Ok(("sqlite".to_string(), "items".to_string()))
+        );
         assert!(parse_table_from_uri("mysql:///data").is_err());
         assert!(parse_table_from_uri("mysql://users/other").is_err());
         assert!(parse_table_from_uri("invalid").is_err());
