@@ -10,7 +10,9 @@ use sqlx::{AnyPool, Column, Row, any::AnyRow};
 use crate::error::AppError;
 
 /// Maximum allowed length for a validated table name.
-/// Set to 128 to be safe across MySQL (64), PostgreSQL (63), and SQLite (no hard limit).
+/// Set to 128 as a generous upper bound; individual engines may enforce stricter limits
+/// (MySQL: 64, PostgreSQL: 63). Names exceeding the engine's limit will be rejected at
+/// query time.
 const MAX_TABLE_NAME_LEN: usize = 128;
 
 /// Supported database engine types.
@@ -49,8 +51,11 @@ impl DbType {
     /// Detects the database type from a connection URL by examining the scheme prefix.
     ///
     /// Supports `mysql://`, `mysql+*`, `postgres://`, `postgresql://`, `postgres+*`,
-    /// `sqlite://`, and `sqlite:` schemes. Error messages intentionally include only the
-    /// scheme portion to avoid leaking credentials from the URL.
+    /// `sqlite://`, and `sqlite:` schemes. Note: `postgresql+*` variants
+    /// (e.g., `postgresql+unix://`) are not supported; use `postgres+*` instead.
+    ///
+    /// Error messages intentionally include only the scheme portion to avoid leaking
+    /// credentials from the URL.
     pub fn from_url(url: &str) -> Result<Self, AppError> {
         if url.starts_with("mysql://") || url.starts_with("mysql+") {
             Ok(Self::Mysql)
@@ -82,6 +87,11 @@ impl DbType {
         }
     }
 
+    /// Returns a [`DescribeQuery`] for retrieving column metadata of the given table.
+    ///
+    /// MySQL and PostgreSQL use parameterized `information_schema` queries.
+    /// SQLite uses `PRAGMA table_info` with the table name interpolated (safe because
+    /// [`ValidatedTableName`] guarantees only `[a-zA-Z0-9_]` characters).
     pub(crate) fn describe_table_query(&self, table: &ValidatedTableName) -> DescribeQuery {
         match self {
             Self::Mysql => DescribeQuery::Parameterized(
@@ -128,10 +138,30 @@ impl DbType {
 pub struct ValidatedTableName(String);
 
 impl ValidatedTableName {
+    /// Creates a new `ValidatedTableName` after validating the input.
+    ///
+    /// # Validation rules
+    /// - Must not be empty.
+    /// - Must contain only ASCII alphanumeric characters and underscores (`[a-zA-Z0-9_]`).
+    /// - Must not exceed [`MAX_TABLE_NAME_LEN`] (128) characters.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidTableName`] describing the specific validation failure.
     pub fn new(name: &str) -> Result<Self, AppError> {
         if name.is_empty() {
             return Err(AppError::InvalidTableName("table name must not be empty".to_string()));
         }
+        // Character validation MUST run before the length check so that the byte-level
+        // slice in the length error message (`&name[..32]`) never lands inside a
+        // multi-byte UTF-8 code point.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            let preview: String = name.chars().take(64).collect();
+            return Err(AppError::InvalidTableName(format!(
+                "table name '{preview}' contains invalid characters (only ASCII alphanumeric and underscores allowed)",
+            )));
+        }
+        // At this point all characters are ASCII, so byte length == character count
+        // and byte-level slicing is safe.
         if name.len() > MAX_TABLE_NAME_LEN {
             return Err(AppError::InvalidTableName(format!(
                 "table name '{}...' exceeds maximum length of {} characters",
@@ -139,15 +169,10 @@ impl ValidatedTableName {
                 MAX_TABLE_NAME_LEN
             )));
         }
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(AppError::InvalidTableName(format!(
-                "table name '{}' contains invalid characters (only ASCII alphanumeric and underscores allowed)",
-                name
-            )));
-        }
         Ok(Self(name.to_string()))
     }
 
+    /// Returns the validated table name as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -167,9 +192,16 @@ pub struct DatabaseConnection {
 }
 
 impl DatabaseConnection {
+    /// Connects to a database using the given URL, auto-detecting the engine type.
+    ///
+    /// Supports the same URL schemes as [`DbType::from_url`]. Connection errors are
+    /// wrapped in [`AppError::ConnectionFailed`] to avoid potentially leaking
+    /// credentials embedded in the URL through raw sqlx error messages.
     pub async fn connect(url: &str) -> Result<Self, AppError> {
         let db_type = DbType::from_url(url)?;
-        let pool = AnyPool::connect(url).await?;
+        let pool = AnyPool::connect(url)
+            .await
+            .map_err(|e| AppError::ConnectionFailed(format!("{db_type}: {e}")))?;
         Ok(Self { pool, db_type })
     }
 
@@ -180,14 +212,17 @@ impl DatabaseConnection {
         Self { pool, db_type }
     }
 
+    /// Returns a reference to the underlying connection pool.
     pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
 
+    /// Returns the detected database engine type.
     pub fn db_type(&self) -> DbType {
         self.db_type
     }
 
+    /// Fetches column metadata for the given table using a dialect-appropriate query.
     pub async fn describe_table(
         &self,
         table: &ValidatedTableName,
@@ -205,18 +240,17 @@ impl DatabaseConnection {
 /// Strips leading SQL comments (`--` line comments and `/* */` block comments)
 /// from a query string. Returns the remaining SQL with leading whitespace trimmed.
 ///
-/// Returns an error if an unterminated comment is detected.
+/// A `--` line comment extends to the next newline or end of input (per SQL standard).
+/// Returns an error only for unterminated block comments (`/*` without closing `*/`).
 fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
     let mut s = sql.trim_start();
     loop {
         if s.starts_with("--") {
-            // Skip to end of line
             s = match s.find('\n') {
                 Some(pos) => s[pos + 1..].trim_start(),
-                None => return Err("unterminated line comment (-- without newline)"),
+                None => "",
             };
         } else if s.starts_with("/*") {
-            // Skip to closing */
             s = match s.find("*/") {
                 Some(pos) => s[pos + 2..].trim_start(),
                 None => return Err("unterminated block comment (/* without closing */)"),
@@ -230,8 +264,9 @@ fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
 
 /// Checks the query for syntactic issues that would cause misclassification.
 ///
-/// Currently detects unterminated SQL comments. Returns an error message
-/// describing the issue, suitable for returning to MCP clients.
+/// Currently detects unterminated block comments (`/* ... */`). Call this before
+/// [`is_read_query`] to get a proper error for malformed queries; `is_read_query`
+/// conservatively returns `false` on parse failure.
 pub fn validate_query_syntax(query: &str) -> Result<(), &'static str> {
     strip_leading_sql_comments(query)?;
     Ok(())
@@ -283,7 +318,8 @@ pub fn is_read_query(query: &str) -> bool {
     // response-format purposes. EXPLAIN ANALYZE may execute the underlying
     // query as a side effect, but the response is still a result set.
     // This means EXPLAIN ANALYZE of DML (e.g., DELETE) will actually execute
-    // the statement, which is accepted since execute_sql is already marked destructive.
+    // the statement, which is accepted since the tool is intended for arbitrary
+    // SQL execution including writes (see `execute_sql` tool in server.rs).
     const READ_PREFIXES: &[&str] = &["SELECT", "SHOW", "PRAGMA", "DESCRIBE", "EXPLAIN"];
 
     if READ_PREFIXES
@@ -461,11 +497,24 @@ mod tests {
         let err = ValidatedTableName::new("").unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
 
+        // Character check now runs before length check, so a too-long ASCII name
+        // still gets the length error.
         let too_long = "a".repeat(MAX_TABLE_NAME_LEN + 1);
         let err = ValidatedTableName::new(&too_long).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum length"));
 
         let err = ValidatedTableName::new("bad;name").unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_validated_table_name_multibyte_utf8_does_not_panic() {
+        // 31 ASCII chars + 4-byte emoji + enough ASCII to exceed MAX_TABLE_NAME_LEN bytes.
+        // This must not panic; the character validation should reject it before the length check.
+        let mut name = "a".repeat(31);
+        name.push('\u{1F600}'); // 4-byte emoji
+        name.push_str(&"b".repeat(100));
+        let err = ValidatedTableName::new(&name).unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
@@ -692,17 +741,22 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_leading_sql_comments_unterminated() {
+    fn test_strip_leading_sql_comments_unterminated_block() {
         assert!(strip_leading_sql_comments("/* unterminated").is_err());
-        assert!(strip_leading_sql_comments("-- no newline").is_err());
+    }
+
+    #[test]
+    fn test_strip_leading_sql_comments_line_comment_no_newline() {
+        // Per SQL standard, `--` extends to end of input when there is no newline.
+        assert_eq!(strip_leading_sql_comments("-- no newline"), Ok(""));
     }
 
     #[test]
     fn test_validate_query_syntax() {
         assert!(validate_query_syntax("SELECT 1").is_ok());
         assert!(validate_query_syntax("-- comment\nSELECT 1").is_ok());
+        assert!(validate_query_syntax("-- no newline").is_ok());
         assert!(validate_query_syntax("/* unterminated").is_err());
-        assert!(validate_query_syntax("-- no newline").is_err());
     }
 
     #[test]
