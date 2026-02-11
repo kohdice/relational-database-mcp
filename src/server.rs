@@ -17,8 +17,13 @@ use crate::db::{self, DatabaseConnection, ValidatedTableName};
 use crate::error::sqlx_to_mcp_error;
 
 /// Maximum number of rows returned in a single `execute_sql` response.
-/// Queries returning more rows are truncated with a notification to the caller.
+/// Queries returning this many rows or more are truncated with a notification to the caller.
 const MAX_RESULT_ROWS: usize = 10_000;
+
+/// Maximum number of rows returned in a single resource read response.
+/// Kept deliberately smaller than [`MAX_RESULT_ROWS`] because resource reads
+/// are intended for quick data previews, not full exports.
+const MAX_RESOURCE_ROWS: usize = 100;
 
 /// Core handler implementing [`ServerHandler`] from `rmcp`, dispatching MCP tool calls
 /// to the underlying [`DatabaseConnection`].
@@ -104,8 +109,7 @@ impl McpServer {
                 return Ok(CallToolResult::success(vec![Content::text("Query returned 0 rows.")]));
             }
 
-            let display_rows = if truncated { &rows[..MAX_RESULT_ROWS] } else { &rows };
-            let mut csv = db::rows_to_csv(display_rows);
+            let mut csv = db::rows_to_csv(&rows);
             if truncated {
                 csv.push_str(&format!(
                     "\n\n(Note: Results truncated. Showing first {MAX_RESULT_ROWS} rows.)"
@@ -258,7 +262,7 @@ impl ServerHandler for McpServer {
         let table_name = ValidatedTableName::new(&raw_name).map_err(|e| e.into_mcp_error())?;
 
         let quoted = self.db.db_type().quote_identifier(&table_name);
-        let sql = format!("SELECT * FROM {quoted} LIMIT 100");
+        let sql = format!("SELECT * FROM {quoted} LIMIT {MAX_RESOURCE_ROWS}");
         let rows = sqlx::query(&sql).fetch_all(self.db.pool()).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "read resource failed");
             sqlx_to_mcp_error(e)
