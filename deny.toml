@@ -1,5 +1,9 @@
 [advisories]
-ignore = []
+ignore = [
+    # rsa v0.9.10 (RUSTSEC-2023-0071): transitive dependency via sqlx-mysql.
+    # No patched version available. Not exploitable in our usage (local MCP server, not network-facing RSA).
+    "RUSTSEC-2023-0071",
+]
 unmaintained = "all"
 
 [licenses]
@@ -11,6 +15,7 @@ allow = [
     "ISC",
     "CC0-1.0",
     "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 exceptions = []

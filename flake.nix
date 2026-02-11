@@ -38,6 +38,7 @@
           nativeBuildInputs = with pkgs; [
             rust
             cargo-deny
+            pkg-config
           ];
         };
 
