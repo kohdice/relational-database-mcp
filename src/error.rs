@@ -67,18 +67,23 @@ pub(crate) fn sqlx_to_mcp_error(e: sqlx::Error) -> McpError {
         ),
         // Infrastructure errors → INTERNAL_ERROR
         sqlx::Error::PoolTimedOut => {
+            tracing::error!("database connection pool timed out");
             McpError::internal_error("database connection pool timed out".to_string(), None)
         }
         sqlx::Error::Io(io_err) => {
+            tracing::error!(error = %io_err, "database I/O error");
             McpError::internal_error(format!("database I/O error: {io_err}"), None)
         }
         sqlx::Error::Tls(tls_err) => {
+            tracing::error!(error = %tls_err, "database TLS error");
             McpError::internal_error(format!("database TLS error: {tls_err}"), None)
         }
         sqlx::Error::Configuration(cfg_err) => {
+            tracing::error!(error = %cfg_err, "database configuration error");
             McpError::internal_error(format!("database configuration error: {cfg_err}"), None)
         }
         sqlx::Error::Protocol(msg) => {
+            tracing::error!(error = %msg, "database protocol error");
             McpError::internal_error(format!("database protocol error: {msg}"), None)
         }
         sqlx::Error::WorkerCrashed => {
@@ -86,7 +91,7 @@ pub(crate) fn sqlx_to_mcp_error(e: sqlx::Error) -> McpError {
             McpError::internal_error("database worker crashed".to_string(), None)
         }
         other => {
-            tracing::warn!(error = %other, "unrecognized sqlx error variant");
+            tracing::error!(error = %other, "unrecognized sqlx error variant");
             McpError::internal_error(format!("database error: {other}"), None)
         }
     }
