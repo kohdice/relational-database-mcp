@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("{0}")]
     InvalidTableName(String),
 
+    #[error("connection failed: {0}")]
+    ConnectionFailed(String),
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -31,6 +34,7 @@ impl AppError {
             Self::UnsupportedScheme(_) | Self::InvalidTableName(_) => {
                 McpError::invalid_params(msg, None)
             }
+            Self::ConnectionFailed(_) => McpError::internal_error(msg, None),
             Self::Database(e) => sqlx_to_mcp_error(e),
         }
     }
@@ -38,15 +42,30 @@ impl AppError {
 
 /// Converts a [`sqlx::Error`] into an MCP protocol error.
 ///
-/// `Database` errors (SQL syntax errors, constraint violations, etc.) are mapped to
-/// `INVALID_PARAMS` because they are typically caused by user-provided SQL.
-/// Infrastructure errors (pool timeout, I/O, TLS, configuration) are mapped to
-/// `INTERNAL_ERROR`.
+/// User-triggered errors (SQL syntax errors, constraint violations, missing rows/columns,
+/// decode failures) are mapped to `INVALID_PARAMS`.
+/// Infrastructure errors (pool timeout, I/O, TLS, configuration, protocol, worker crash)
+/// are mapped to `INTERNAL_ERROR`.
 pub(crate) fn sqlx_to_mcp_error(e: sqlx::Error) -> McpError {
     match &e {
+        // User-triggered errors → INVALID_PARAMS
         sqlx::Error::Database(db_err) => {
             McpError::invalid_params(format!("database query error: {db_err}"), None)
         }
+        sqlx::Error::RowNotFound => {
+            McpError::invalid_params("no matching row found".to_string(), None)
+        }
+        sqlx::Error::ColumnNotFound(col) => {
+            McpError::invalid_params(format!("column not found: {col}"), None)
+        }
+        sqlx::Error::ColumnDecode { .. } => {
+            McpError::invalid_params(format!("failed to decode column value: {e}"), None)
+        }
+        sqlx::Error::ColumnIndexOutOfBounds { index, len } => McpError::invalid_params(
+            format!("column index {index} out of bounds (columns: {len})"),
+            None,
+        ),
+        // Infrastructure errors → INTERNAL_ERROR
         sqlx::Error::PoolTimedOut => {
             McpError::internal_error("database connection pool timed out".to_string(), None)
         }
@@ -58,6 +77,13 @@ pub(crate) fn sqlx_to_mcp_error(e: sqlx::Error) -> McpError {
         }
         sqlx::Error::Configuration(cfg_err) => {
             McpError::internal_error(format!("database configuration error: {cfg_err}"), None)
+        }
+        sqlx::Error::Protocol(msg) => {
+            McpError::internal_error(format!("database protocol error: {msg}"), None)
+        }
+        sqlx::Error::WorkerCrashed => {
+            tracing::error!("database connection pool worker crashed");
+            McpError::internal_error("database worker crashed".to_string(), None)
         }
         other => {
             tracing::warn!(error = %other, "unrecognized sqlx error variant");
@@ -91,12 +117,26 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlx_to_mcp_error_database_query_error() {
-        // sqlx::Error::Database maps to INVALID_PARAMS
-        let db_err = sqlx::Error::Protocol("test protocol error".to_string());
-        let mcp = sqlx_to_mcp_error(db_err);
-        // Protocol errors fall into the catch-all, which is INTERNAL_ERROR
+    fn test_sqlx_to_mcp_error_protocol() {
+        let err = sqlx::Error::Protocol("test protocol error".to_string());
+        let mcp = sqlx_to_mcp_error(err);
         assert_eq!(mcp.code, ErrorCode::INTERNAL_ERROR);
+        assert!(mcp.message.contains("protocol error"));
+    }
+
+    #[test]
+    fn test_sqlx_to_mcp_error_row_not_found() {
+        let err = sqlx::Error::RowNotFound;
+        let mcp = sqlx_to_mcp_error(err);
+        assert_eq!(mcp.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn test_sqlx_to_mcp_error_column_not_found() {
+        let err = sqlx::Error::ColumnNotFound("nonexistent".to_string());
+        let mcp = sqlx_to_mcp_error(err);
+        assert_eq!(mcp.code, ErrorCode::INVALID_PARAMS);
+        assert!(mcp.message.contains("nonexistent"));
     }
 
     #[test]
