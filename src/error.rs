@@ -11,6 +11,7 @@ use thiserror::Error;
 ///
 /// Each variant maps to a specific MCP error code via [`into_mcp_error`](Self::into_mcp_error):
 /// - `UnsupportedScheme` / `InvalidTableName` → `INVALID_PARAMS`
+/// - `ConnectionFailed` → `INTERNAL_ERROR`
 /// - `Database` → delegated to [`sqlx_to_mcp_error`]
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -43,7 +44,7 @@ impl AppError {
 /// Converts a [`sqlx::Error`] into an MCP protocol error.
 ///
 /// User-triggered errors (SQL syntax errors, constraint violations, missing rows/columns,
-/// decode failures) are mapped to `INVALID_PARAMS`.
+/// column index out of bounds, decode failures) are mapped to `INVALID_PARAMS`.
 /// Infrastructure errors (pool timeout, I/O, TLS, configuration, protocol, worker crash)
 /// are mapped to `INTERNAL_ERROR`.
 pub(crate) fn sqlx_to_mcp_error(e: sqlx::Error) -> McpError {

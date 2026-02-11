@@ -73,7 +73,8 @@ impl DbType {
         }
     }
 
-    /// Returns the SQL query to list user tables for this database engine.
+    /// Returns the SQL query to list tables in the default user-facing schema
+    /// (MySQL: current database, PostgreSQL: `public`, SQLite: non-system tables).
     pub fn list_tables_query(&self) -> &'static str {
         match self {
             Self::Mysql => {
@@ -245,6 +246,9 @@ impl DatabaseConnection {
 /// from a query string. Returns the remaining SQL with leading whitespace trimmed.
 ///
 /// A `--` line comment extends to the next newline or end of input (per SQL standard).
+/// Nested block comments (`/* /* */ */`) are not supported; only the first `*/`
+/// after the opening `/*` is matched. This is safe for downstream classification
+/// since the remnant will not match any read-query prefix.
 /// Returns an error only for unterminated block comments (`/*` without closing `*/`).
 fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
     let mut s = sql.trim_start();
@@ -506,8 +510,8 @@ mod tests {
         let err = ValidatedTableName::new("").unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
 
-        // Character check now runs before length check, so a too-long ASCII name
-        // still gets the length error.
+        // An all-ASCII name that exceeds the max length should trigger the length error
+        // (the character check passes first since all characters are valid).
         let too_long = "a".repeat(MAX_TABLE_NAME_LEN + 1);
         let err = ValidatedTableName::new(&too_long).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum length"));

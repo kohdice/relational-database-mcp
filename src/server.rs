@@ -69,7 +69,7 @@ impl McpServer {
 
     #[tool(
         name = "execute_sql",
-        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, etc.) return results as CSV. Write and DDL queries return the number of affected rows.",
+        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return results as CSV. Write and DDL queries return the number of affected rows.",
         annotations(destructive_hint = true)
     )]
     async fn execute_sql(
@@ -90,6 +90,8 @@ impl McpServer {
         tracing::debug!(query = %query, "executing SQL");
 
         if db::is_read_query(query) {
+            // Stream rows incrementally to avoid buffering unbounded result sets in memory.
+            // We stop after MAX_RESULT_ROWS and discard the rest of the stream.
             let mut stream = sqlx::query(query).fetch(self.db.pool());
             let mut rows = Vec::new();
             let mut truncated = false;
