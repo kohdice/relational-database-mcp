@@ -251,8 +251,8 @@ fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
                 None => "",
             };
         } else if s.starts_with("/*") {
-            s = match s.find("*/") {
-                Some(pos) => s[pos + 2..].trim_start(),
+            s = match s[2..].find("*/") {
+                Some(pos) => s[pos + 4..].trim_start(),
                 None => return Err("unterminated block comment (/* without closing */)"),
             };
         } else {
@@ -743,6 +743,14 @@ mod tests {
     #[test]
     fn test_strip_leading_sql_comments_unterminated_block() {
         assert!(strip_leading_sql_comments("/* unterminated").is_err());
+    }
+
+    #[test]
+    fn test_strip_leading_sql_comments_slash_star_slash_is_unterminated() {
+        // "/*/" is an unterminated block comment, NOT a zero-length comment.
+        // The `*/` at positions 1-2 overlaps with the opening `/*` at positions 0-1,
+        // so it must not be treated as a closing delimiter.
+        assert!(strip_leading_sql_comments("/*/ SELECT 1").is_err());
     }
 
     #[test]
