@@ -245,17 +245,9 @@ async fn test_rows_to_csv_blob_invalid_utf8() {
 
 #[tokio::test]
 async fn test_describe_table_dispatch_sqlite() {
-    sqlx::any::install_default_drivers();
-    let pool =
-        sqlx::pool::PoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-
-    sqlx::query("CREATE TABLE test_tbl (id INTEGER PRIMARY KEY, name TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
+    let pool = setup_pool().await;
     let db = DatabaseConnection::from_pool(pool, DbType::Sqlite);
-    let table = db::ValidatedTableName::new("test_tbl").unwrap();
+    let table = db::ValidatedTableName::new("users").unwrap();
     let rows = db.describe_table(&table).await.unwrap();
     let csv = db::rows_to_csv(&rows);
 

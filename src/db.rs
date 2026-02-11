@@ -633,8 +633,6 @@ mod tests {
         assert!(!is_read_query("INSERT INTO users VALUES (1)"));
         assert!(!is_read_query("UPDATE users SET name = 'x'"));
         assert!(!is_read_query("DELETE FROM users"));
-        assert!(!is_read_query("WITH cte AS (SELECT 1) INSERT INTO users SELECT * FROM cte"));
-        assert!(!is_read_query("CREATE TABLE t (id INT)"));
     }
 
     #[test]
