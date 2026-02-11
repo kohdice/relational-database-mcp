@@ -37,7 +37,7 @@ nix develop
 ### Build and Test
 
 ```bash
-zig build test
+cargo test
 ```
 
 ## How to Contribute
