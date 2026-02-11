@@ -1,3 +1,9 @@
+//! MCP server implementation exposing relational database operations as tools and resources.
+//!
+//! Provides three MCP tools (`execute_sql`, `list_tables`, `describe_table`) and
+//! an MCP resource interface for browsing table data.
+
+use futures_util::TryStreamExt;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters, model::*, service::RequestContext, tool, tool_handler,
@@ -10,8 +16,11 @@ use sqlx::Row;
 use crate::db::{self, DatabaseConnection, ValidatedTableName};
 use crate::error::sqlx_to_mcp_error;
 
+/// Maximum number of rows returned in a single `execute_sql` response.
+/// Queries returning more rows are truncated with a notification to the caller.
 const MAX_RESULT_ROWS: usize = 10_000;
 
+/// MCP server that exposes relational database operations as MCP tools and resources.
 #[derive(Clone)]
 pub struct McpServer {
     db: DatabaseConnection,
@@ -60,36 +69,49 @@ impl McpServer {
         &self,
         params: Parameters<ExecuteSqlParams>,
     ) -> Result<CallToolResult, McpError> {
-        let query = params.0.query.trim().to_string();
+        let raw_query = params.0.query;
+        let query = raw_query.trim();
 
         if query.is_empty() {
             return Err(McpError::invalid_params("query must not be empty".to_string(), None));
         }
 
+        if let Err(reason) = db::validate_query_syntax(query) {
+            return Err(McpError::invalid_params(format!("invalid SQL: {reason}"), None));
+        }
+
         tracing::debug!(query = %query, "executing SQL");
 
-        if db::is_read_query(&query) {
-            let rows = sqlx::query(&query).fetch_all(self.db.pool()).await.map_err(|e| {
+        if db::is_read_query(query) {
+            let mut stream = sqlx::query(query).fetch(self.db.pool());
+            let mut rows = Vec::new();
+            let mut truncated = false;
+            while let Some(row) = stream.try_next().await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "read query failed");
                 sqlx_to_mcp_error(e)
-            })?;
+            })? {
+                rows.push(row);
+                if rows.len() > MAX_RESULT_ROWS {
+                    truncated = true;
+                    break;
+                }
+            }
+            drop(stream);
 
             if rows.is_empty() {
                 return Ok(CallToolResult::success(vec![Content::text("Query returned 0 rows.")]));
             }
 
-            let truncated = rows.len() > MAX_RESULT_ROWS;
             let display_rows = if truncated { &rows[..MAX_RESULT_ROWS] } else { &rows };
             let mut csv = db::rows_to_csv(display_rows);
             if truncated {
                 csv.push_str(&format!(
-                    "\n\n(Note: Results truncated. Showing {MAX_RESULT_ROWS} of {} rows.)",
-                    rows.len()
+                    "\n\n(Note: Results truncated. Showing first {MAX_RESULT_ROWS} rows.)"
                 ));
             }
             Ok(CallToolResult::success(vec![Content::text(csv)]))
         } else {
-            let result = sqlx::query(&query).execute(self.db.pool()).await.map_err(|e| {
+            let result = sqlx::query(query).execute(self.db.pool()).await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "write query failed");
                 sqlx_to_mcp_error(e)
             })?;
@@ -163,33 +185,54 @@ impl ServerHandler for McpServer {
     ) -> Result<ListResourcesResult, McpError> {
         let tables = self.fetch_table_names().await?;
         let scheme = self.db.db_type().resource_uri_scheme();
+        let mut skipped_tables: Vec<String> = Vec::new();
         let resources: Vec<Resource> = tables
             .into_iter()
-            .filter(|table_name| {
-                if ValidatedTableName::new(table_name).is_err() {
+            .filter_map(|table_name| {
+                if ValidatedTableName::new(&table_name).is_err() {
                     tracing::warn!(table_name = %table_name, "skipping table with invalid name");
-                    false
-                } else {
-                    true
+                    skipped_tables.push(table_name);
+                    return None;
                 }
-            })
-            .map(|table_name| {
                 let uri = format!("{scheme}://{table_name}/data");
-                RawResource {
-                    uri,
-                    name: format!("Table: {table_name}"),
-                    title: None,
-                    description: Some(format!("Data in table {table_name}")),
-                    mime_type: Some("text/csv".to_string()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                }
-                .no_annotation()
+                Some(
+                    RawResource {
+                        uri,
+                        name: format!("Table: {table_name}"),
+                        title: None,
+                        description: Some(format!("Data in table {table_name}")),
+                        mime_type: Some("text/csv".to_string()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    }
+                    .no_annotation(),
+                )
             })
             .collect();
 
-        Ok(ListResourcesResult { meta: None, resources, next_cursor: None })
+        let meta = if skipped_tables.is_empty() {
+            None
+        } else {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "skippedTables".to_string(),
+                serde_json::Value::Array(
+                    skipped_tables.iter().map(|t| serde_json::Value::String(t.clone())).collect(),
+                ),
+            );
+            map.insert(
+                "warning".to_string(),
+                serde_json::Value::String(format!(
+                    "{} table(s) were excluded because their names contain characters not supported by this server (only ASCII alphanumeric and underscores are allowed): {}",
+                    skipped_tables.len(),
+                    skipped_tables.join(", ")
+                )),
+            );
+            Some(Meta(map))
+        };
+
+        Ok(ListResourcesResult { meta, resources, next_cursor: None })
     }
 
     async fn read_resource(
@@ -224,9 +267,8 @@ impl ServerHandler for McpServer {
 /// Extracts a table name from a resource URI of the form `{scheme}://{table_name}/data`.
 /// Returns an error describing the specific parsing failure.
 fn parse_table_from_uri(uri: &str) -> Result<String, String> {
-    let rest = uri
-        .split("://")
-        .nth(1)
+    let (_, rest) = uri
+        .split_once("://")
         .ok_or_else(|| format!("URI missing '://' scheme separator: {uri}"))?;
     let table_name = rest
         .strip_suffix("/data")
