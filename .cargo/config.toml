@@ -1,0 +1,8 @@
+[alias]
+b = "build"
+c = "check"
+f = "fmt"
+l = "clippy"
+t = "test"
+r = "run"
+rr = "run --release"

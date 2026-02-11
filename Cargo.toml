@@ -1,0 +1,11 @@
+[package]
+name = "relational-database-mcp"
+version = "0.1.0"
+authors = ["kohdice <k@kohdice.com>"]
+description = "MCP server to access Relational Database."
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kohdice/relational-database-mcp"
+rust-version = "1.92"
+
+[dependencies]
