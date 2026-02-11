@@ -1,11 +1,22 @@
+//! Database abstraction layer for MySQL, PostgreSQL, and SQLite.
+//!
+//! Provides database type detection, connection management, SQL query classification,
+//! table name validation, and CSV serialization of query results.
+
 use std::fmt;
 
 use sqlx::{AnyPool, Column, Row, any::AnyRow};
 
 use crate::error::AppError;
 
+/// Maximum allowed length for a validated table name.
+/// Set to 128 to be safe across MySQL (64), PostgreSQL (63), and SQLite (no hard limit).
 const MAX_TABLE_NAME_LEN: usize = 128;
 
+/// Supported database engine types.
+///
+/// Each variant encapsulates dialect-specific behavior: SQL system catalog queries,
+/// identifier quoting, and resource URI schemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DbType {
     Mysql,
@@ -24,6 +35,9 @@ impl fmt::Display for DbType {
 }
 
 /// Describes how to execute a table-description query.
+///
+/// The safety of the `Interpolated` variant depends on the [`ValidatedTableName`] invariant
+/// guaranteeing that only `[a-zA-Z0-9_]` characters are present.
 pub(crate) enum DescribeQuery {
     /// Query with a bind parameter (`?` or `$1`) for the table name.
     Parameterized(&'static str),
@@ -32,6 +46,11 @@ pub(crate) enum DescribeQuery {
 }
 
 impl DbType {
+    /// Detects the database type from a connection URL by examining the scheme prefix.
+    ///
+    /// Supports `mysql://`, `mysql+*`, `postgres://`, `postgresql://`, `postgres+*`,
+    /// `sqlite://`, and `sqlite:` schemes. Error messages intentionally include only the
+    /// scheme portion to avoid leaking credentials from the URL.
     pub fn from_url(url: &str) -> Result<Self, AppError> {
         if url.starts_with("mysql://") || url.starts_with("mysql+") {
             Ok(Self::Mysql)
@@ -48,6 +67,7 @@ impl DbType {
         }
     }
 
+    /// Returns the SQL query to list user tables for this database engine.
     pub fn list_tables_query(&self) -> &'static str {
         match self {
             Self::Mysql => {
@@ -83,6 +103,8 @@ impl DbType {
         }
     }
 
+    /// Wraps a validated table name in dialect-appropriate quotes
+    /// (backticks for MySQL, double quotes for PostgreSQL/SQLite).
     pub fn quote_identifier(&self, name: &ValidatedTableName) -> String {
         match self {
             Self::Mysql => format!("`{}`", name.as_str()),
@@ -90,6 +112,7 @@ impl DbType {
         }
     }
 
+    /// Returns the URI scheme used for MCP resource identifiers.
     pub fn resource_uri_scheme(&self) -> &'static str {
         match self {
             Self::Mysql => "mysql",
@@ -106,11 +129,21 @@ pub struct ValidatedTableName(String);
 
 impl ValidatedTableName {
     pub fn new(name: &str) -> Result<Self, AppError> {
-        if name.is_empty()
-            || name.len() > MAX_TABLE_NAME_LEN
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(AppError::InvalidTableName(name.to_string()));
+        if name.is_empty() {
+            return Err(AppError::InvalidTableName("table name must not be empty".to_string()));
+        }
+        if name.len() > MAX_TABLE_NAME_LEN {
+            return Err(AppError::InvalidTableName(format!(
+                "table name '{}...' exceeds maximum length of {} characters",
+                &name[..32],
+                MAX_TABLE_NAME_LEN
+            )));
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(AppError::InvalidTableName(format!(
+                "table name '{}' contains invalid characters (only ASCII alphanumeric and underscores allowed)",
+                name
+            )));
         }
         Ok(Self(name.to_string()))
     }
@@ -140,7 +173,9 @@ impl DatabaseConnection {
         Ok(Self { pool, db_type })
     }
 
-    #[doc(hidden)]
+    /// Creates a `DatabaseConnection` from an existing pool. Intended for testing only;
+    /// the caller must ensure `db_type` matches the actual database behind `pool`.
+    /// Prefer [`connect`](Self::connect) for production use.
     pub fn from_pool(pool: AnyPool, db_type: DbType) -> Self {
         Self { pool, db_type }
     }
@@ -156,39 +191,50 @@ impl DatabaseConnection {
     pub async fn describe_table(
         &self,
         table: &ValidatedTableName,
-    ) -> Result<Vec<AnyRow>, sqlx::Error> {
+    ) -> Result<Vec<AnyRow>, AppError> {
         let describe = self.db_type.describe_table_query(table);
         match describe {
             DescribeQuery::Parameterized(sql) => {
-                sqlx::query(sql).bind(table.as_str()).fetch_all(&self.pool).await
+                Ok(sqlx::query(sql).bind(table.as_str()).fetch_all(&self.pool).await?)
             }
-            DescribeQuery::Interpolated(sql) => sqlx::query(&sql).fetch_all(&self.pool).await,
+            DescribeQuery::Interpolated(sql) => Ok(sqlx::query(&sql).fetch_all(&self.pool).await?),
         }
     }
 }
 
 /// Strips leading SQL comments (`--` line comments and `/* */` block comments)
 /// from a query string. Returns the remaining SQL with leading whitespace trimmed.
-fn strip_leading_sql_comments(sql: &str) -> &str {
+///
+/// Returns an error if an unterminated comment is detected.
+fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
     let mut s = sql.trim_start();
     loop {
         if s.starts_with("--") {
             // Skip to end of line
             s = match s.find('\n') {
                 Some(pos) => s[pos + 1..].trim_start(),
-                None => return "",
+                None => return Err("unterminated line comment (-- without newline)"),
             };
         } else if s.starts_with("/*") {
             // Skip to closing */
             s = match s.find("*/") {
                 Some(pos) => s[pos + 2..].trim_start(),
-                None => return "",
+                None => return Err("unterminated block comment (/* without closing */)"),
             };
         } else {
             break;
         }
     }
-    s
+    Ok(s)
+}
+
+/// Checks the query for syntactic issues that would cause misclassification.
+///
+/// Currently detects unterminated SQL comments. Returns an error message
+/// describing the issue, suitable for returning to MCP clients.
+pub fn validate_query_syntax(query: &str) -> Result<(), &'static str> {
+    strip_leading_sql_comments(query)?;
+    Ok(())
 }
 
 /// Checks that a keyword at position 0..prefix_len is followed by a word boundary
@@ -210,8 +256,16 @@ fn is_keyword_at_boundary(s: &str, prefix_len: usize) -> bool {
 ///
 /// Note: semicolons inside string literals would cause a false rejection,
 /// but this is an acceptable trade-off for preventing multi-statement injection.
+/// Similarly, write keywords appearing inside string literals within a CTE
+/// query would cause a false classification as non-read, which is again
+/// accepted as a conservative safety trade-off.
 pub fn is_read_query(query: &str) -> bool {
-    let no_comments = strip_leading_sql_comments(query);
+    let no_comments = match strip_leading_sql_comments(query) {
+        Ok(s) => s,
+        // Unterminated comment: conservatively classify as write (non-read).
+        // Callers should use validate_query_syntax() first to get a proper error.
+        Err(_) => return false,
+    };
     let upper = no_comments.to_uppercase();
 
     if upper.is_empty() {
@@ -258,23 +312,31 @@ pub fn rows_to_csv(rows: &[AnyRow]) -> String {
     }
 
     let columns = rows[0].columns();
-    let header: Vec<String> = columns.iter().map(|c| escape_csv_field(c.name())).collect();
-    let mut lines = vec![header.join(",")];
+    let mut csv = String::new();
 
-    for row in rows {
-        let vals: Vec<String> = columns
-            .iter()
-            .map(|col| escape_csv_field(&row_value_to_string(row, col.ordinal())))
-            .collect();
-        lines.push(vals.join(","));
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            csv.push(',');
+        }
+        csv.push_str(&escape_csv_field(col.name()));
     }
 
-    lines.join("\n")
+    for row in rows {
+        csv.push('\n');
+        for (i, col) in columns.iter().enumerate() {
+            if i > 0 {
+                csv.push(',');
+            }
+            csv.push_str(&escape_csv_field(&row_value_to_string(row, col.ordinal())));
+        }
+    }
+
+    csv
 }
 
 /// Escapes a CSV field according to RFC 4180: fields containing commas,
-/// double quotes, or newlines are enclosed in double quotes, with internal
-/// double quotes doubled.
+/// double quotes, newlines (`\n`), or carriage returns (`\r`) are enclosed
+/// in double quotes, with internal double quotes doubled.
 fn escape_csv_field(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
@@ -319,7 +381,16 @@ fn row_value_to_string(row: &AnyRow, index: usize) -> String {
     if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
         return v.map_or_else(|| "NULL".to_string(), bytes_to_string);
     }
-    tracing::warn!(column_index = index, "failed to decode column value as any known type");
+
+    let col_name = row.columns().get(index).map_or("<unknown>", |c| c.name());
+    let col_type =
+        row.columns().get(index).map(|c| format!("{:?}", c.type_info())).unwrap_or_default();
+    tracing::warn!(
+        column_index = index,
+        column_name = col_name,
+        column_type = %col_type,
+        "failed to decode column value as any known type"
+    );
     "<error: unsupported type>".to_string()
 }
 
@@ -383,6 +454,19 @@ mod tests {
         assert!(ValidatedTableName::new("users; DROP TABLE users").is_err());
         assert!(ValidatedTableName::new("table-name").is_err());
         assert!(ValidatedTableName::new("table name").is_err());
+    }
+
+    #[test]
+    fn test_validated_table_name_error_messages() {
+        let err = ValidatedTableName::new("").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+
+        let too_long = "a".repeat(MAX_TABLE_NAME_LEN + 1);
+        let err = ValidatedTableName::new(&too_long).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum length"));
+
+        let err = ValidatedTableName::new("bad;name").unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
@@ -594,23 +678,31 @@ mod tests {
 
     #[test]
     fn test_strip_leading_sql_comments_line_comment() {
-        assert_eq!(strip_leading_sql_comments("-- comment\nSELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_sql_comments("-- comment\nSELECT 1"), Ok("SELECT 1"));
     }
 
     #[test]
     fn test_strip_leading_sql_comments_block_comment() {
-        assert_eq!(strip_leading_sql_comments("/* comment */ SELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_sql_comments("/* comment */ SELECT 1"), Ok("SELECT 1"));
     }
 
     #[test]
     fn test_strip_leading_sql_comments_no_comment() {
-        assert_eq!(strip_leading_sql_comments("SELECT 1"), "SELECT 1");
+        assert_eq!(strip_leading_sql_comments("SELECT 1"), Ok("SELECT 1"));
     }
 
     #[test]
     fn test_strip_leading_sql_comments_unterminated() {
-        assert_eq!(strip_leading_sql_comments("/* unterminated"), "");
-        assert_eq!(strip_leading_sql_comments("-- no newline"), "");
+        assert!(strip_leading_sql_comments("/* unterminated").is_err());
+        assert!(strip_leading_sql_comments("-- no newline").is_err());
+    }
+
+    #[test]
+    fn test_validate_query_syntax() {
+        assert!(validate_query_syntax("SELECT 1").is_ok());
+        assert!(validate_query_syntax("-- comment\nSELECT 1").is_ok());
+        assert!(validate_query_syntax("/* unterminated").is_err());
+        assert!(validate_query_syntax("-- no newline").is_err());
     }
 
     #[test]

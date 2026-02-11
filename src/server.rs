@@ -128,7 +128,7 @@ impl McpServer {
 
         let rows = self.db.describe_table(&table_name).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "describe table failed");
-            sqlx_to_mcp_error(e)
+            e.into_mcp_error()
         })?;
 
         if rows.is_empty() {
