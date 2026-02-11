@@ -3,6 +3,7 @@
 //! Provides database type detection, connection management, SQL query classification,
 //! table name validation, and CSV serialization of query results.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use sqlx::{AnyPool, Column, Row, any::AnyRow};
@@ -275,9 +276,14 @@ pub fn validate_query_syntax(query: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Checks that a keyword at position 0..prefix_len is followed by a word boundary
+/// Checks that a keyword at position `0..prefix_len` is followed by a word boundary
 /// (whitespace, `(`, or end of string).
+///
+/// # Panics
+/// Panics if `prefix_len > s.len()`. Callers must ensure
+/// `s.starts_with(keyword)` before calling with `keyword.len()`.
 fn is_keyword_at_boundary(s: &str, prefix_len: usize) -> bool {
+    debug_assert!(prefix_len <= s.len(), "prefix_len exceeds string length");
     if s.len() == prefix_len {
         return true;
     }
@@ -376,11 +382,11 @@ pub fn rows_to_csv(rows: &[AnyRow]) -> String {
 /// Escapes a CSV field according to RFC 4180: fields containing commas,
 /// double quotes, newlines (`\n`), or carriage returns (`\r`) are enclosed
 /// in double quotes, with internal double quotes doubled.
-fn escape_csv_field(field: &str) -> String {
+fn escape_csv_field(field: &str) -> Cow<'_, str> {
     if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
+        Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
     } else {
-        field.to_string()
+        Cow::Borrowed(field)
     }
 }
 
