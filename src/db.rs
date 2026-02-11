@@ -199,9 +199,12 @@ impl DatabaseConnection {
     /// credentials embedded in the URL through raw sqlx error messages.
     pub async fn connect(url: &str) -> Result<Self, AppError> {
         let db_type = DbType::from_url(url)?;
-        let pool = AnyPool::connect(url)
-            .await
-            .map_err(|e| AppError::ConnectionFailed(format!("{db_type}: {e}")))?;
+        let pool = AnyPool::connect(url).await.map_err(|e| {
+            tracing::error!(db_type = %db_type, error = %e, "database connection failed");
+            AppError::ConnectionFailed(format!(
+                "{db_type}: failed to establish database connection"
+            ))
+        })?;
         Ok(Self { pool, db_type })
     }
 
