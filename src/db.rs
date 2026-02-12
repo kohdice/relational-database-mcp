@@ -6,9 +6,36 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use sqlx::{AnyPool, Column, Row, any::AnyRow};
+use futures_util::TryStreamExt;
+use sqlx::{Column, Row, ValueRef};
 
 use crate::error::AppError;
+
+/// Database-specific connection pool.
+///
+/// Each variant wraps a native pool for its respective database engine.
+/// Using native pools instead of `AnyPool` avoids the limited type-mapping layer
+/// in sqlx's `Any` driver, which fails on types like `TINYINT UNSIGNED` and `TIMESTAMP`.
+#[derive(Debug, Clone)]
+pub(crate) enum DatabasePool {
+    Mysql(sqlx::MySqlPool),
+    Postgres(sqlx::PgPool),
+    Sqlite(sqlx::SqlitePool),
+}
+
+/// Dispatches a method call across the three `DatabasePool` variants.
+///
+/// The body is monomorphized for each native pool type, allowing generic
+/// sqlx operations to resolve to the correct concrete types.
+macro_rules! with_pool {
+    ($self:expr, |$pool:ident| $body:expr) => {
+        match $self {
+            DatabasePool::Mysql($pool) => $body,
+            DatabasePool::Postgres($pool) => $body,
+            DatabasePool::Sqlite($pool) => $body,
+        }
+    };
+}
 
 /// Maximum allowed length for a validated table name.
 /// Set to 128 as a generous upper bound; individual engines may enforce stricter limits
@@ -186,10 +213,122 @@ impl fmt::Display for ValidatedTableName {
     }
 }
 
+/// Escapes a CSV field according to RFC 4180: fields containing commas,
+/// double quotes, newlines (`\n`), or carriage returns (`\r`) are enclosed
+/// in double quotes, with internal double quotes doubled.
+fn escape_csv_field(field: &str) -> Cow<'_, str> {
+    if field.contains([',', '"', '\n', '\r']) {
+        Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
+    } else {
+        Cow::Borrowed(field)
+    }
+}
+
+/// Converts raw bytes to a UTF-8 string, or a placeholder describing the binary data size.
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|e| format!("<binary data: {} bytes>", e.into_bytes().len()))
+}
+
+/// Decodes a single column value to a string representation.
+///
+/// Tries types in order: String, i64, f64, bool, chrono datetimes, Vec<u8>,
+/// then nullable variants. Like `rows_to_csv!`, this is a macro to avoid
+/// complex generic trait bounds.
+macro_rules! row_value_to_string {
+    ($row:expr, $index:expr) => {{
+        let row = $row;
+        let index = $index;
+        // Check for NULL first using try_get_raw. Native SQLite driver skips
+        // type checks for null values, which causes String::decode to return ""
+        // instead of failing. Explicit null check prevents this.
+        if row.try_get_raw(index).is_ok_and(|v| v.is_null()) {
+            "NULL".to_string()
+        // String covers VARCHAR, TEXT, CHAR, ENUM, etc.
+        } else if let Ok(v) = row.try_get::<String, _>(index) {
+            v
+        } else if let Ok(v) = row.try_get::<i64, _>(index) {
+            v.to_string()
+        } else if let Ok(v) = row.try_get::<f64, _>(index) {
+            v.to_string()
+        } else if let Ok(v) = row.try_get::<bool, _>(index) {
+            v.to_string()
+        // chrono types for TIMESTAMP, DATETIME, DATE, TIME
+        } else if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(index) {
+            v.to_string()
+        } else if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(index) {
+            v.to_string()
+        } else if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(index) {
+            v.to_string()
+        // BLOB / BYTEA
+        } else if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
+            bytes_to_string(v)
+        // NULL fallbacks — tried after non-Option variants exhaust
+        } else if let Ok(v) = row.try_get::<Option<String>, _>(index) {
+            v.unwrap_or_else(|| "NULL".to_string())
+        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
+            v.map_or_else(|| "NULL".to_string(), |dt| dt.to_string())
+        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
+            v.map_or_else(|| "NULL".to_string(), bytes_to_string)
+        } else {
+            let col_name = row.columns().get(index).map_or("<unknown>", |c| c.name());
+            let col_type = row
+                .columns()
+                .get(index)
+                .map(|c| format!("{:?}", c.type_info()))
+                .unwrap_or_default();
+            tracing::warn!(
+                column_index = index,
+                column_name = col_name,
+                column_type = %col_type,
+                "failed to decode column value as any known type"
+            );
+            "<error: unsupported type>".to_string()
+        }
+    }};
+}
+
+/// Generates CSV from a slice of database rows.
+///
+/// Defined as a macro instead of a generic function because the `Row::try_get`
+/// calls require `Decode + Type` bounds for every target type, which are
+/// impractical to express as `where` clauses. The macro is expanded inside
+/// each `with_pool!` arm where the concrete row type is known.
+macro_rules! rows_to_csv {
+    ($rows:expr) => {{
+        let rows = &$rows;
+        if rows.is_empty() {
+            String::new()
+        } else {
+            let columns = rows[0].columns();
+            let mut csv = String::new();
+
+            for (i, col) in columns.iter().enumerate() {
+                if i > 0 {
+                    csv.push(',');
+                }
+                csv.push_str(&escape_csv_field(col.name()));
+            }
+
+            for row in rows.iter() {
+                csv.push('\n');
+                for (i, col) in columns.iter().enumerate() {
+                    if i > 0 {
+                        csv.push(',');
+                    }
+                    csv.push_str(&escape_csv_field(&row_value_to_string!(row, col.ordinal())));
+                }
+            }
+
+            csv
+        }
+    }};
+}
+
 /// A database connection bundling a connection pool with its detected database type.
 #[derive(Debug, Clone)]
 pub struct DatabaseConnection {
-    pool: AnyPool,
+    pool: DatabasePool,
     db_type: DbType,
 }
 
@@ -201,25 +340,30 @@ impl DatabaseConnection {
     /// credentials embedded in the URL through raw sqlx error messages.
     pub async fn connect(url: &str) -> Result<Self, AppError> {
         let db_type = DbType::from_url(url)?;
-        let pool = AnyPool::connect(url).await.map_err(|e| {
+        let connection_error = |e: sqlx::Error| {
             tracing::error!(db_type = %db_type, error = %e, "database connection failed");
             AppError::ConnectionFailed(format!(
                 "{db_type}: failed to establish database connection"
             ))
-        })?;
+        };
+        let pool = match db_type {
+            DbType::Mysql => {
+                DatabasePool::Mysql(sqlx::MySqlPool::connect(url).await.map_err(connection_error)?)
+            }
+            DbType::Postgres => {
+                DatabasePool::Postgres(sqlx::PgPool::connect(url).await.map_err(connection_error)?)
+            }
+            DbType::Sqlite => DatabasePool::Sqlite(
+                sqlx::SqlitePool::connect(url).await.map_err(connection_error)?,
+            ),
+        };
         Ok(Self { pool, db_type })
     }
 
-    /// Creates a `DatabaseConnection` from an existing pool. Intended for testing only;
-    /// the caller must ensure `db_type` matches the actual database behind `pool`.
-    /// Prefer [`connect`](Self::connect) for production use.
-    pub fn from_pool(pool: AnyPool, db_type: DbType) -> Self {
-        Self { pool, db_type }
-    }
-
-    /// Returns a reference to the underlying connection pool.
-    pub fn pool(&self) -> &AnyPool {
-        &self.pool
+    /// Creates a `DatabaseConnection` from an existing SQLite pool.
+    /// Intended for testing only. Prefer [`connect`](Self::connect) for production use.
+    pub fn from_sqlite_pool(pool: sqlx::SqlitePool) -> Self {
+        Self { pool: DatabasePool::Sqlite(pool), db_type: DbType::Sqlite }
     }
 
     /// Returns the detected database engine type.
@@ -227,18 +371,71 @@ impl DatabaseConnection {
         self.db_type
     }
 
-    /// Fetches column metadata for the given table using a dialect-appropriate query.
-    pub async fn describe_table(
+    /// Fetches all rows for a SELECT query and returns the result as CSV.
+    pub async fn fetch_all_as_csv(&self, sql: &str) -> Result<String, sqlx::Error> {
+        with_pool!(&self.pool, |pool| {
+            let rows = sqlx::query(sql).fetch_all(pool).await?;
+            Ok(rows_to_csv!(rows))
+        })
+    }
+
+    /// Streams rows for a SELECT query and returns CSV, stopping after `max_rows`.
+    /// Returns `(csv, truncated)` where `truncated` indicates if more rows exist.
+    pub async fn fetch_streaming_as_csv(
+        &self,
+        sql: &str,
+        max_rows: usize,
+    ) -> Result<(String, bool), sqlx::Error> {
+        with_pool!(&self.pool, |pool| {
+            let mut stream = sqlx::query(sql).fetch(pool);
+            let mut rows = Vec::new();
+            let mut truncated = false;
+            while let Some(row) = stream.try_next().await? {
+                rows.push(row);
+                if rows.len() >= max_rows {
+                    truncated = true;
+                    break;
+                }
+            }
+            drop(stream);
+            Ok((rows_to_csv!(rows), truncated))
+        })
+    }
+
+    /// Fetches the first column of each row as a `String`.
+    /// Useful for retrieving table name lists.
+    pub async fn fetch_column_as_strings(&self, sql: &str) -> Result<Vec<String>, sqlx::Error> {
+        with_pool!(&self.pool, |pool| {
+            let rows = sqlx::query(sql).fetch_all(pool).await?;
+            rows.iter().map(|row| row.try_get::<String, _>(0)).collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Executes a write/DDL query, returning the number of affected rows.
+    pub async fn execute_sql(&self, sql: &str) -> Result<u64, sqlx::Error> {
+        with_pool!(&self.pool, |pool| {
+            let result = sqlx::query(sql).execute(pool).await?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    /// Fetches column metadata for the given table and returns it as CSV.
+    pub async fn describe_table_as_csv(
         &self,
         table: &ValidatedTableName,
-    ) -> Result<Vec<AnyRow>, AppError> {
+    ) -> Result<String, AppError> {
         let describe = self.db_type.describe_table_query(table);
-        match describe {
-            DescribeQuery::Parameterized(sql) => {
-                Ok(sqlx::query(sql).bind(table.as_str()).fetch_all(&self.pool).await?)
-            }
-            DescribeQuery::Interpolated(sql) => Ok(sqlx::query(&sql).fetch_all(&self.pool).await?),
-        }
+        let csv = match describe {
+            DescribeQuery::Parameterized(sql) => with_pool!(&self.pool, |pool| {
+                let rows = sqlx::query(sql).bind(table.as_str()).fetch_all(pool).await?;
+                Ok::<String, sqlx::Error>(rows_to_csv!(rows))
+            })?,
+            DescribeQuery::Interpolated(sql) => with_pool!(&self.pool, |pool| {
+                let rows = sqlx::query(&sql).fetch_all(pool).await?;
+                Ok::<String, sqlx::Error>(rows_to_csv!(rows))
+            })?,
+        };
+        Ok(csv)
     }
 }
 
@@ -350,97 +547,6 @@ pub fn is_read_query(query: &str) -> bool {
     }
 
     false
-}
-
-/// Converts database rows to a CSV string (RFC 4180 field escaping).
-/// Returns an empty string if the input slice is empty.
-/// The first line is a header row of column names.
-pub fn rows_to_csv(rows: &[AnyRow]) -> String {
-    if rows.is_empty() {
-        return String::new();
-    }
-
-    let columns = rows[0].columns();
-    let mut csv = String::new();
-
-    for (i, col) in columns.iter().enumerate() {
-        if i > 0 {
-            csv.push(',');
-        }
-        csv.push_str(&escape_csv_field(col.name()));
-    }
-
-    for row in rows {
-        csv.push('\n');
-        for (i, col) in columns.iter().enumerate() {
-            if i > 0 {
-                csv.push(',');
-            }
-            csv.push_str(&escape_csv_field(&row_value_to_string(row, col.ordinal())));
-        }
-    }
-
-    csv
-}
-
-/// Escapes a CSV field according to RFC 4180: fields containing commas,
-/// double quotes, newlines (`\n`), or carriage returns (`\r`) are enclosed
-/// in double quotes, with internal double quotes doubled.
-fn escape_csv_field(field: &str) -> Cow<'_, str> {
-    if field.contains([',', '"', '\n', '\r']) {
-        Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
-    } else {
-        Cow::Borrowed(field)
-    }
-}
-
-/// Converts raw bytes to a UTF-8 string, or a placeholder describing the binary data size.
-fn bytes_to_string(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|e| format!("<binary data: {} bytes>", e.into_bytes().len()))
-}
-
-fn row_value_to_string(row: &AnyRow, index: usize) -> String {
-    // sqlx Any driver supports limited type decoding.
-    // Try types in order: String, i64, f64, bool, Vec<u8> (Blob).
-    //
-    // MySQL's information_schema columns (e.g. DATA_TYPE, COLUMN_TYPE) are longtext,
-    // which MySQL's wire protocol reports as Blob type. The Any driver maps these to
-    // AnyValueKind::Blob, so they fail String decoding. We fall through to Vec<u8>
-    // and convert the bytes to a UTF-8 string.
-    if let Ok(v) = row.try_get::<String, _>(index) {
-        return v;
-    }
-    if let Ok(v) = row.try_get::<i64, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<f64, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<bool, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
-        return bytes_to_string(v);
-    }
-    // Non-Option decodings all failed — the value is likely NULL.
-    if let Ok(v) = row.try_get::<Option<String>, _>(index) {
-        return v.unwrap_or_else(|| "NULL".to_string());
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return v.map_or_else(|| "NULL".to_string(), bytes_to_string);
-    }
-
-    let col_name = row.columns().get(index).map_or("<unknown>", |c| c.name());
-    let col_type =
-        row.columns().get(index).map(|c| format!("{:?}", c.type_info())).unwrap_or_default();
-    tracing::warn!(
-        column_index = index,
-        column_name = col_name,
-        column_type = %col_type,
-        "failed to decode column value as any known type"
-    );
-    "<error: unsupported type>".to_string()
 }
 
 #[cfg(test)]
