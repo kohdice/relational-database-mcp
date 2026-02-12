@@ -3,7 +3,6 @@
 //! Provides three MCP tools (`execute_sql`, `list_tables`, `describe_table`) and
 //! an MCP resource interface for browsing table data.
 
-use futures_util::TryStreamExt;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters, model::*, service::RequestContext, tool, tool_handler,
@@ -11,7 +10,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use sqlx::Row;
 
 use crate::db::{self, DatabaseConnection, ValidatedTableName};
 use crate::error::sqlx_to_mcp_error;
@@ -48,15 +46,7 @@ pub struct DescribeTableParams {
 impl McpServer {
     async fn fetch_table_names(&self) -> Result<Vec<String>, McpError> {
         let sql = self.db.db_type().list_tables_query();
-        let rows = sqlx::query(sql).fetch_all(self.db.pool()).await.map_err(sqlx_to_mcp_error)?;
-        rows.iter()
-            .map(|row| {
-                row.try_get::<String, _>(0).map_err(|e| {
-                    tracing::error!(error = %e, "failed to read table name from row");
-                    McpError::internal_error(format!("failed to decode table name: {e}"), None)
-                })
-            })
-            .collect()
+        self.db.fetch_column_as_strings(sql).await.map_err(sqlx_to_mcp_error)
     }
 }
 
@@ -90,40 +80,29 @@ impl McpServer {
         tracing::debug!(query = %query, "executing SQL");
 
         if db::is_read_query(query) {
-            // Stream rows incrementally to avoid buffering unbounded result sets in memory.
-            // We stop after MAX_RESULT_ROWS and discard the rest of the stream.
-            let mut stream = sqlx::query(query).fetch(self.db.pool());
-            let mut rows = Vec::new();
-            let mut truncated = false;
-            while let Some(row) = stream.try_next().await.map_err(|e| {
-                tracing::error!(query = %query, error = %e, "read query failed");
-                sqlx_to_mcp_error(e)
-            })? {
-                rows.push(row);
-                if rows.len() >= MAX_RESULT_ROWS {
-                    truncated = true;
-                    break;
-                }
-            }
-            drop(stream);
+            let (csv, truncated) =
+                self.db.fetch_streaming_as_csv(query, MAX_RESULT_ROWS).await.map_err(|e| {
+                    tracing::error!(query = %query, error = %e, "read query failed");
+                    sqlx_to_mcp_error(e)
+                })?;
 
-            if rows.is_empty() {
+            if csv.is_empty() {
                 return Ok(CallToolResult::success(vec![Content::text("Query returned 0 rows.")]));
             }
 
-            let mut csv = db::rows_to_csv(&rows);
+            let mut result_csv = csv;
             if truncated {
-                csv.push_str(&format!(
+                result_csv.push_str(&format!(
                     "\n\n(Note: Results truncated. Showing first {MAX_RESULT_ROWS} rows.)"
                 ));
             }
-            Ok(CallToolResult::success(vec![Content::text(csv)]))
+            Ok(CallToolResult::success(vec![Content::text(result_csv)]))
         } else {
-            let result = sqlx::query(query).execute(self.db.pool()).await.map_err(|e| {
+            let rows_affected = self.db.execute_sql(query).await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "write query failed");
                 sqlx_to_mcp_error(e)
             })?;
-            let text = format!("Rows affected: {}", result.rows_affected());
+            let text = format!("Rows affected: {rows_affected}");
             Ok(CallToolResult::success(vec![Content::text(text)]))
         }
     }
@@ -156,19 +135,18 @@ impl McpServer {
         let table_name =
             ValidatedTableName::new(&params.0.table_name).map_err(|e| e.into_mcp_error())?;
 
-        let rows = self.db.describe_table(&table_name).await.map_err(|e| {
+        let csv = self.db.describe_table_as_csv(&table_name).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "describe table failed");
             e.into_mcp_error()
         })?;
 
-        if rows.is_empty() {
+        if csv.is_empty() {
             return Err(McpError::resource_not_found(
                 format!("table '{}' not found or has no columns", table_name),
                 None,
             ));
         }
 
-        let csv = db::rows_to_csv(&rows);
         Ok(CallToolResult::success(vec![Content::text(csv)]))
     }
 }
@@ -265,12 +243,10 @@ impl ServerHandler for McpServer {
 
         let quoted = self.db.db_type().quote_identifier(&table_name);
         let sql = format!("SELECT * FROM {quoted} LIMIT {MAX_RESOURCE_ROWS}");
-        let rows = sqlx::query(&sql).fetch_all(self.db.pool()).await.map_err(|e| {
+        let csv = self.db.fetch_all_as_csv(&sql).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "read resource failed");
             sqlx_to_mcp_error(e)
         })?;
-
-        let csv = db::rows_to_csv(&rows);
         let content = if csv.is_empty() {
             format!("Table '{}' exists but contains no rows.", table_name)
         } else {
