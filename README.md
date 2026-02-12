@@ -31,7 +31,14 @@ The binary will be at `target/release/rdb-mcp`.
 rdb-mcp --database-url <CONNECTION_STRING>
 ```
 
-The database type is automatically detected from the URL scheme.
+The connection string can also be provided via the `DATABASE_URL` environment variable:
+
+```bash
+export DATABASE_URL="mysql://user:pass@localhost:3306/mydb"
+rdb-mcp
+```
+
+When both `--database-url` and `DATABASE_URL` are provided, the CLI argument takes precedence. The database type is automatically detected from the URL scheme.
 
 ### Connection examples
 
@@ -57,7 +64,9 @@ Add the following to your Claude Desktop configuration file (`claude_desktop_con
   "mcpServers": {
     "rdb-mcp": {
       "command": "/path/to/rdb-mcp",
-      "args": ["--database-url", "sqlite:./data.db"]
+      "env": {
+        "DATABASE_URL": "sqlite:./data.db"
+      }
     }
   }
 }
@@ -72,17 +81,21 @@ Add to your `.mcp.json`:
   "mcpServers": {
     "rdb-mcp": {
       "command": "/path/to/rdb-mcp",
-      "args": ["--database-url", "mysql://user:pass@localhost:3306/mydb"]
+      "env": {
+        "DATABASE_URL": "mysql://user:pass@localhost:3306/mydb"
+      }
     }
   }
 }
 ```
 
+> **Note**: You can also use `"args": ["--database-url", "<CONNECTION_STRING>"]` instead of `"env"`. The `env` approach is recommended as it avoids placing credentials directly in the arguments list.
+
 ## Tools
 
 ### `execute_sql`
 
-Execute an arbitrary SQL query. SELECT queries return results as CSV. DML queries return the number of affected rows.
+Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return results as CSV. Write and DDL queries return the number of affected rows. Results are limited to 10,000 rows; larger result sets are truncated with a notification.
 
 | Parameter | Type   | Required | Description          |
 | --------- | ------ | -------- | -------------------- |
@@ -91,13 +104,13 @@ Execute an arbitrary SQL query. SELECT queries return results as CSV. DML querie
 **Examples:**
 
 ```
--- SELECT returns CSV
+-- Read queries return CSV
 execute_sql({ "query": "SELECT id, name FROM users" })
 → id,name
   1,Alice
   2,Bob
 
--- INSERT/UPDATE/DELETE returns affected row count
+-- Write/DDL queries return affected row count
 execute_sql({ "query": "INSERT INTO users (name) VALUES ('Charlie')" })
 → Rows affected: 1
 ```
@@ -115,7 +128,7 @@ list_tables()
 
 ### `describe_table`
 
-Describe the schema of a specific table, returning column names, data types, and constraints.
+Describe the schema of a specific table, returning column names, data types, nullability, and defaults. Constraint details vary by database engine.
 
 | Parameter    | Type   | Required | Description                   |
 | ------------ | ------ | -------- | ----------------------------- |
