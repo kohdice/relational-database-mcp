@@ -60,7 +60,7 @@ cargo deny check                                            # license & vulnerab
 
 ### cargo-deny (`deny.toml`)
 
-- Allowed licenses: MPL-2.0, MIT, Apache-2.0, BSD-3-Clause, ISC, CC0-1.0, Unicode-3.0
+- Allowed licenses: MPL-2.0, MIT, Apache-2.0, BSD-3-Clause, ISC, CC0-1.0, Unicode-3.0, Zlib
 - Wildcard dependencies are denied
 - Only the crates.io registry is allowed
 
