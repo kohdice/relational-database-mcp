@@ -1,4 +1,4 @@
-# rdb-mcp
+# Relational Database MCP
 
 MCP (Model Context Protocol) server for accessing relational databases. Supports MySQL, PostgreSQL, and SQLite through a unified interface.
 
