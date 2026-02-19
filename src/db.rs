@@ -407,7 +407,12 @@ impl DatabaseConnection {
     pub async fn fetch_column_as_strings(&self, sql: &str) -> Result<Vec<String>, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let rows = sqlx::query(sql).fetch_all(pool).await?;
-            rows.iter().map(|row| row.try_get::<String, _>(0)).collect::<Result<Vec<_>, _>>()
+            rows.iter()
+                .map(|row| {
+                    row.try_get::<String, _>(0)
+                        .or_else(|_| row.try_get::<Vec<u8>, _>(0).map(bytes_to_string))
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
     }
 
