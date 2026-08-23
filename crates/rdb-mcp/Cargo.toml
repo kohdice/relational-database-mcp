@@ -1,9 +1,8 @@
 [package]
 name = "rdb-mcp"
-description = "MCP server to access Relational Database over stdio."
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
+description = "MCP server to access Relational Database over stdio."
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true

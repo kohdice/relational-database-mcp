@@ -1,9 +1,8 @@
 [package]
 name = "rdb-mcp-core"
-description = "Core library for the Relational Database MCP server."
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
+description = "Core library for the Relational Database MCP server."
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
