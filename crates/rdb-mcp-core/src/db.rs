@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use futures_util::TryStreamExt;
-use sqlx::{Column, Row, ValueRef};
+use sqlx::{AssertSqlSafe, Column, Row, ValueRef};
 
 use crate::error::AppError;
 
@@ -375,9 +375,14 @@ impl DatabaseConnection {
     }
 
     /// Fetches all rows for a SELECT query and returns the result as CSV.
+    ///
+    /// `sql` is wrapped in [`AssertSqlSafe`] because running caller-supplied SQL is the
+    /// purpose of this server; injection is not a meaningful threat here. Statements are
+    /// instead constrained upstream by [`is_read_query`] (which rejects multi-statement
+    /// input) and [`ValidatedTableName`] (which restricts interpolated identifiers).
     pub async fn fetch_all_as_csv(&self, sql: &str) -> Result<String, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
-            let rows = sqlx::query(sql).fetch_all(pool).await?;
+            let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
             Ok(rows_to_csv!(rows))
         })
     }
@@ -390,7 +395,7 @@ impl DatabaseConnection {
         max_rows: usize,
     ) -> Result<(String, bool), sqlx::Error> {
         with_pool!(&self.pool, |pool| {
-            let mut stream = sqlx::query(sql).fetch(pool);
+            let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(pool);
             let mut rows = Vec::new();
             let mut truncated = false;
             while let Some(row) = stream.try_next().await? {
@@ -409,7 +414,7 @@ impl DatabaseConnection {
     /// Useful for retrieving table name lists.
     pub async fn fetch_column_as_strings(&self, sql: &str) -> Result<Vec<String>, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
-            let rows = sqlx::query(sql).fetch_all(pool).await?;
+            let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
             rows.iter()
                 .map(|row| {
                     row.try_get::<String, _>(0)
@@ -422,7 +427,7 @@ impl DatabaseConnection {
     /// Executes a write/DDL query, returning the number of affected rows.
     pub async fn execute_sql(&self, sql: &str) -> Result<u64, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
-            let result = sqlx::query(sql).execute(pool).await?;
+            let result = sqlx::query(AssertSqlSafe(sql)).execute(pool).await?;
             Ok(result.rows_affected())
         })
     }
@@ -439,7 +444,7 @@ impl DatabaseConnection {
                 Ok::<String, sqlx::Error>(rows_to_csv!(rows))
             })?,
             DescribeQuery::Interpolated(sql) => with_pool!(&self.pool, |pool| {
-                let rows = sqlx::query(&sql).fetch_all(pool).await?;
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool).await?;
                 Ok::<String, sqlx::Error>(rows_to_csv!(rows))
             })?,
         };

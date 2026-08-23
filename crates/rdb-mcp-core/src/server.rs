@@ -23,6 +23,9 @@ const MAX_RESULT_ROWS: usize = 10_000;
 /// are intended for quick data previews, not full exports.
 const MAX_RESOURCE_ROWS: usize = 100;
 
+/// Implementation name advertised to clients during initialization.
+const SERVER_NAME: &str = "rdb-mcp";
+
 /// Core handler implementing [`ServerHandler`] from `rmcp`, dispatching MCP tool calls
 /// to the underlying [`DatabaseConnection`].
 #[derive(Clone)]
@@ -91,7 +94,9 @@ impl McpServer {
                 })?;
 
             if csv.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text("Query returned 0 rows.")]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Query returned 0 rows.",
+                )]));
             }
 
             let mut result_csv = csv;
@@ -100,14 +105,14 @@ impl McpServer {
                     "\n\n(Note: Results truncated. Showing first {MAX_RESULT_ROWS} rows.)"
                 ));
             }
-            Ok(CallToolResult::success(vec![Content::text(result_csv)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(result_csv)]))
         } else {
             let rows_affected = self.db.execute_sql(query).await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "write query failed");
                 sqlx_to_mcp_error(e)
             })?;
             let text = format!("Rows affected: {rows_affected}");
-            Ok(CallToolResult::success(vec![Content::text(text)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
         }
     }
 
@@ -119,12 +124,12 @@ impl McpServer {
     async fn list_tables(&self) -> Result<CallToolResult, McpError> {
         let tables = self.fetch_table_names().await?;
         if tables.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No tables found in the database.",
             )]));
         }
         let text = tables.join("\n");
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -151,21 +156,23 @@ impl McpServer {
             ));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(csv)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(csv)]))
     }
 }
 
-#[tool_handler]
+// `router` is set explicitly because rmcp 3.x defaults to `Self::tool_router()`, which
+// would rebuild and re-register the whole router on every tool call and listing.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().enable_resources().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "MCP server to access Relational Database (MySQL, PostgreSQL, SQLite)".to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            // `Implementation::from_build_env()` resolves `env!` at rmcp's own compile time,
+            // so it would advertise the SDK's crate name and version instead of this server's.
+            .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "MCP server to access Relational Database (MySQL, PostgreSQL, SQLite)",
+            )
     }
 
     async fn list_resources(
@@ -186,17 +193,9 @@ impl ServerHandler for McpServer {
                 }
                 let uri = format!("{scheme}://{table_name}/data");
                 Some(
-                    RawResource {
-                        uri,
-                        name: format!("Table: {table_name}"),
-                        title: None,
-                        description: Some(format!("Data in table {table_name}")),
-                        mime_type: Some("text/csv".to_string()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    }
-                    .no_annotation(),
+                    Resource::new(uri, format!("Table: {table_name}"))
+                        .with_description(format!("Data in table {table_name}"))
+                        .with_mime_type("text/csv"),
                 )
             })
             .collect();
@@ -219,17 +218,19 @@ impl ServerHandler for McpServer {
                     skipped_tables.join(", ")
                 )),
             );
-            Some(Meta(map))
+            Some(MetaObject(map))
         };
 
-        Ok(ListResourcesResult { meta, resources, next_cursor: None })
+        let mut result = ListResourcesResult::with_all_items(resources);
+        result.meta = meta;
+        Ok(result)
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = &request.uri;
 
         let (scheme, raw_name) =
@@ -256,7 +257,7 @@ impl ServerHandler for McpServer {
         } else {
             csv
         };
-        Ok(ReadResourceResult { contents: vec![ResourceContents::text(content, uri.clone())] })
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into())
     }
 }
 

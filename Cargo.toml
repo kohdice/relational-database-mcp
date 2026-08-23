@@ -12,25 +12,25 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 rdb-mcp-core = { path = "crates/rdb-mcp-core" }
-anyhow = "1.0.101"
-chrono = "0.4.43"
-clap = { version = "4.5.58", features = ["derive", "env"] }
-futures-util = "0.3.32"
-rmcp = { version = "0.16.0", features = ["server", "transport-io"] }
-schemars = "1.2.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-sqlx = { version = "0.8.6", features = [
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+futures-util = "0.3.34"
+rmcp = { version = "3.1.4", features = ["server", "transport-io"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "chrono",
     "mysql",
     "postgres",
     "sqlite",
 ] }
-thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["full"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = "0.3.23"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
