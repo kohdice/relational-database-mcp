@@ -41,7 +41,8 @@ fn cell(rows: &[Vec<Option<String>>], row: usize, column: usize) -> Option<&str>
 async fn test_select_query_returns_columns_and_rows() {
     let db = setup_db().await;
 
-    let result = db.fetch_all("SELECT id, name, email FROM users ORDER BY id").await.unwrap();
+    let result =
+        db.fetch_streaming("SELECT id, name, email FROM users ORDER BY id", 100).await.unwrap();
 
     assert_eq!(result.columns, vec!["id", "name", "email"]);
     assert_eq!(result.row_count, 2);
@@ -66,7 +67,7 @@ async fn test_insert_affects_rows() {
 
     assert_eq!(result.rows_affected, 1);
 
-    let count = db.fetch_all("SELECT COUNT(*) as cnt FROM users").await.unwrap();
+    let count = db.fetch_streaming("SELECT COUNT(*) as cnt FROM users", 100).await.unwrap();
     assert_eq!(cell(&count.rows, 0, 0), Some("3"));
 }
 
@@ -90,7 +91,7 @@ async fn test_delete_affects_rows() {
 
     assert_eq!(result.rows_affected, 1);
 
-    let count = db.fetch_all("SELECT COUNT(*) as cnt FROM users").await.unwrap();
+    let count = db.fetch_streaming("SELECT COUNT(*) as cnt FROM users", 100).await.unwrap();
     assert_eq!(cell(&count.rows, 0, 0), Some("1"));
 }
 
@@ -119,11 +120,11 @@ async fn test_describe_table_sqlite() {
 }
 
 #[tokio::test]
-async fn test_fetch_all_empty_result() {
+async fn test_fetch_streaming_empty_result() {
     let db = setup_db().await;
 
     db.execute_sql("DELETE FROM users").await.unwrap();
-    let result = db.fetch_all("SELECT * FROM users").await.unwrap();
+    let result = db.fetch_streaming("SELECT * FROM users", 100).await.unwrap();
 
     assert!(result.is_empty());
     assert_eq!(result.row_count, 0);
@@ -140,7 +141,8 @@ async fn test_null_values_decode_to_none() {
         .await
         .unwrap();
 
-    let result = db.fetch_all("SELECT id, name, email FROM users WHERE id = 3").await.unwrap();
+    let result =
+        db.fetch_streaming("SELECT id, name, email FROM users WHERE id = 3", 100).await.unwrap();
 
     assert_eq!(result.columns, vec!["id", "name", "email"]);
     assert_eq!(result.row_count, 1);
@@ -170,13 +172,26 @@ async fn test_fetch_streaming_not_truncated_under_limit() {
 }
 
 #[tokio::test]
-async fn test_resource_read_shape() {
+async fn test_fetch_streaming_exact_limit_is_not_truncated() {
     let db = setup_db().await;
 
-    let result = db.fetch_all("SELECT * FROM users LIMIT 100").await.unwrap();
+    // The fixture holds exactly 2 rows, so a limit of 2 cuts nothing short.
+    let result = db.fetch_streaming("SELECT id FROM users ORDER BY id", 2).await.unwrap();
 
-    assert_eq!(result.columns, vec!["id", "name", "email"]);
     assert_eq!(result.row_count, 2);
+    assert!(!result.truncated, "a result that ends at the limit was not truncated");
+}
+
+#[tokio::test]
+async fn test_fetch_streaming_zero_max_rows_returns_no_rows() {
+    let db = setup_db().await;
+
+    let result = db.fetch_streaming("SELECT id FROM users ORDER BY id", 0).await.unwrap();
+
+    assert_eq!(result.row_count, 0);
+    assert!(result.truncated, "rows exist beyond a zero limit");
+    // Column metadata comes from a kept row, so a zero limit reports none.
+    assert!(result.columns.is_empty());
 }
 
 #[tokio::test]
@@ -187,7 +202,7 @@ async fn test_query_result_serializes_null_as_json_null() {
         .await
         .unwrap();
 
-    let result = db.fetch_all("SELECT email FROM users WHERE id = 3").await.unwrap();
+    let result = db.fetch_streaming("SELECT email FROM users WHERE id = 3", 100).await.unwrap();
     let json = serde_json::to_value(&result).unwrap();
 
     assert_eq!(json["columns"], serde_json::json!(["email"]));
@@ -229,14 +244,14 @@ async fn test_database_connection_invalid_url() {
 #[tokio::test]
 async fn test_query_nonexistent_table() {
     let db = setup_db().await;
-    let result = db.fetch_all("SELECT * FROM nonexistent_table").await;
+    let result = db.fetch_streaming("SELECT * FROM nonexistent_table", 100).await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_query_syntax_error() {
     let db = setup_db().await;
-    let result = db.fetch_all("SELEC * FORM users").await;
+    let result = db.fetch_streaming("SELEC * FORM users", 100).await;
     assert!(result.is_err());
 }
 
@@ -249,7 +264,7 @@ async fn test_f64_column() {
         .unwrap();
     db.execute_sql("INSERT INTO prices (id, amount) VALUES (1, 9.99)").await.unwrap();
 
-    let result = db.fetch_all("SELECT id, amount FROM prices").await.unwrap();
+    let result = db.fetch_streaming("SELECT id, amount FROM prices", 100).await.unwrap();
 
     assert_eq!(result.columns, vec!["id", "amount"]);
     assert_eq!(cell(&result.rows, 0, 1), Some("9.99"));
@@ -262,7 +277,7 @@ async fn test_blob_valid_utf8() {
     db.execute_sql("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)").await.unwrap();
     db.execute_sql("INSERT INTO blobs (id, data) VALUES (1, X'68656C6C6F')").await.unwrap();
 
-    let result = db.fetch_all("SELECT id, data FROM blobs").await.unwrap();
+    let result = db.fetch_streaming("SELECT id, data FROM blobs", 100).await.unwrap();
 
     assert_eq!(cell(&result.rows, 0, 1), Some("hello"));
 }
@@ -274,9 +289,9 @@ async fn test_blob_invalid_utf8() {
     db.execute_sql("CREATE TABLE blobs2 (id INTEGER PRIMARY KEY, data BLOB)").await.unwrap();
     db.execute_sql("INSERT INTO blobs2 (id, data) VALUES (1, X'FFFEFD')").await.unwrap();
 
-    let result = db.fetch_all("SELECT id, data FROM blobs2").await.unwrap();
+    let result = db.fetch_streaming("SELECT id, data FROM blobs2", 100).await.unwrap();
 
-    assert_eq!(cell(&result.rows, 0, 1), Some("<binary data: 3 bytes>"));
+    assert_eq!(cell(&result.rows, 0, 1), Some("base64://79"));
 }
 
 #[tokio::test]

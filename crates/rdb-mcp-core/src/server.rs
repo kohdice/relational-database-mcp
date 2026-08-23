@@ -14,8 +14,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{self, DatabaseConnection, ExecutionResult, QueryResult, ValidatedTableName};
+use crate::db::{DatabaseConnection, ExecutionResult, QueryResult, ValidatedTableName};
 use crate::error::sqlx_to_mcp_error;
+use crate::sql;
 
 /// Maximum number of rows returned in a single `execute_sql` response.
 /// Queries returning this many rows or more are truncated with a notification to the caller.
@@ -81,6 +82,36 @@ impl McpServer {
         let sql = self.db.db_type().list_tables_query();
         self.db.fetch_column_as_strings(sql).await.map_err(sqlx_to_mcp_error)
     }
+
+    /// Resolves a table-resource URI and fetches a bounded preview of the table.
+    ///
+    /// Split out of [`Self::read_resource`] so that URI parsing, engine matching,
+    /// name validation, and truncation reporting can be tested without building a
+    /// [`RequestContext`].
+    async fn fetch_table_preview(&self, uri: &str) -> Result<QueryResult, McpError> {
+        let (scheme, raw_name) =
+            parse_table_from_uri(uri).map_err(|e| McpError::resource_not_found(e, None))?;
+
+        let expected_scheme = self.db.db_type().resource_uri_scheme();
+        if scheme != expected_scheme {
+            return Err(McpError::resource_not_found(
+                format!("URI scheme '{scheme}' does not match expected '{expected_scheme}'"),
+                None,
+            ));
+        }
+
+        let table_name = ValidatedTableName::new(&raw_name).map_err(|e| e.into_mcp_error())?;
+        let quoted = self.db.db_type().quote_identifier(&table_name);
+
+        // No LIMIT clause: the row cap belongs to `fetch_streaming`, which has to
+        // see one row past it to tell a cut-off preview from one that simply ends
+        // at the cap. Streaming stops there, so this never scans the whole table.
+        let sql = format!("SELECT * FROM {quoted}");
+        self.db.fetch_streaming(&sql, MAX_RESOURCE_ROWS).await.map_err(|e| {
+            tracing::error!(table = %table_name, error = %e, "read resource failed");
+            sqlx_to_mcp_error(e)
+        })
+    }
 }
 
 #[tool_router]
@@ -92,7 +123,7 @@ impl McpServer {
 
     #[tool(
         name = "execute_sql",
-        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return JSON with `kind: \"query\"`, the column names, and the rows, where a null value means SQL NULL. Write and DDL statements return JSON with `kind: \"execution\"` and the number of affected rows.",
+        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return JSON with `kind: \"query\"`, the column names, and the rows, where a null value means SQL NULL. Write and DDL statements return JSON with `kind: \"execution\"` and the number of affected rows. Binary values that are not valid UTF-8 are returned base64-encoded behind a \"base64:\" prefix. A column whose SQL type this server cannot render as text fails the call; cast it in the query instead.",
         annotations(destructive_hint = true)
     )]
     async fn execute_sql(
@@ -106,13 +137,13 @@ impl McpServer {
             return Err(McpError::invalid_params("query must not be empty".to_string(), None));
         }
 
-        if let Err(reason) = db::validate_query_syntax(query) {
+        if let Err(reason) = sql::validate_query_syntax(query) {
             return Err(McpError::invalid_params(format!("invalid SQL: {reason}"), None));
         }
 
         tracing::debug!(query = %query, "executing SQL");
 
-        if db::is_read_query(query) {
+        if sql::is_read_query(query) {
             let result = self.db.fetch_streaming(query, MAX_RESULT_ROWS).await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "read query failed");
                 sqlx_to_mcp_error(e)
@@ -129,7 +160,7 @@ impl McpServer {
 
     #[tool(
         name = "list_tables",
-        description = "List all tables in the database. Returns JSON with the table names.",
+        description = "List tables in the database's default user-facing schema (MySQL: the current database; PostgreSQL: the `public` schema; SQLite: non-system tables). Returns JSON with the table names.",
         annotations(read_only_hint = true)
     )]
     async fn list_tables(&self) -> Result<Json<ListTablesResult>, McpError> {
@@ -240,27 +271,9 @@ impl ServerHandler for McpServer {
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = &request.uri;
 
-        let (scheme, raw_name) =
-            parse_table_from_uri(uri).map_err(|e| McpError::resource_not_found(e, None))?;
-
-        let expected_scheme = self.db.db_type().resource_uri_scheme();
-        if scheme != expected_scheme {
-            return Err(McpError::resource_not_found(
-                format!("URI scheme '{scheme}' does not match expected '{expected_scheme}'"),
-                None,
-            ));
-        }
-
-        let table_name = ValidatedTableName::new(&raw_name).map_err(|e| e.into_mcp_error())?;
-
-        let quoted = self.db.db_type().quote_identifier(&table_name);
-        let sql = format!("SELECT * FROM {quoted} LIMIT {MAX_RESOURCE_ROWS}");
-        let result = self.db.fetch_all(&sql).await.map_err(|e| {
-            tracing::error!(table = %table_name, error = %e, "read resource failed");
-            sqlx_to_mcp_error(e)
-        })?;
+        let result = self.fetch_table_preview(uri).await?;
         let content = serde_json::to_string(&result).map_err(|e| {
-            tracing::error!(table = %table_name, error = %e, "failed to serialize resource");
+            tracing::error!(uri = %uri, error = %e, "failed to serialize resource");
             McpError::internal_error(format!("failed to serialize resource: {e}"), None)
         })?;
         // `ResourceContents::text` defaults to text/plain; override it so the read
@@ -445,6 +458,69 @@ mod tests {
         };
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_table_preview_returns_rows_for_a_small_table() {
+        let server = setup_server().await;
+
+        let result = server.fetch_table_preview("sqlite://users/data").await.unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert!(!result.truncated, "a table below the cap is not truncated");
+        assert_eq!(result.columns, vec!["id", "name", "email"]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_table_preview_reports_truncation() {
+        let server = setup_server().await;
+        // One row past MAX_RESOURCE_ROWS, so the preview really is cut short.
+        for id in 2..=(MAX_RESOURCE_ROWS as i64 + 1) {
+            server
+                .db
+                .execute_sql(&format!("INSERT INTO users VALUES ({id}, 'user', NULL)"))
+                .await
+                .unwrap();
+        }
+
+        let result = server.fetch_table_preview("sqlite://users/data").await.unwrap();
+
+        assert_eq!(result.row_count, MAX_RESOURCE_ROWS);
+        assert!(result.truncated, "a table above the cap must report truncation");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_table_preview_rejects_wrong_scheme() {
+        let server = setup_server().await;
+
+        let Err(error) = server.fetch_table_preview("mysql://users/data").await else {
+            panic!("a URI for another engine must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_table_preview_rejects_invalid_table_name() {
+        let server = setup_server().await;
+
+        let Err(error) = server.fetch_table_preview("sqlite://users; DROP TABLE users/data").await
+        else {
+            panic!("a table name with invalid characters must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_table_preview_rejects_malformed_uri() {
+        let server = setup_server().await;
+
+        let Err(error) = server.fetch_table_preview("sqlite://users/other").await else {
+            panic!("a URI that does not end in /data must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
     }
 
     #[tokio::test]

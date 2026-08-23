@@ -7,6 +7,9 @@
 //! Transport selection and process startup are the responsibility of the binary
 //! crates that depend on this library.
 
+mod decode;
+
 pub mod db;
 pub mod error;
 pub mod server;
+pub mod sql;

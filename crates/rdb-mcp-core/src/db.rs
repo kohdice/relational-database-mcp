@@ -1,15 +1,17 @@
 //! Database abstraction layer for MySQL, PostgreSQL, and SQLite.
 //!
-//! Provides database type detection, connection management, SQL query classification,
-//! table name validation, and decoding of query results into serializable data.
+//! Provides database type detection, connection management, table name validation,
+//! and query execution returning serializable results. Classifying SQL text is the
+//! job of [`crate::sql`].
 
 use std::fmt;
 
 use futures_util::TryStreamExt;
 use schemars::JsonSchema;
 use serde::Serialize;
-use sqlx::{AssertSqlSafe, Column, Row, ValueRef};
+use sqlx::{AssertSqlSafe, Row};
 
+use crate::decode::{CellDecode, bytes_to_string, column_names, decode_row};
 use crate::error::AppError;
 
 /// Database-specific connection pool.
@@ -82,19 +84,26 @@ pub(crate) enum DescribeQuery {
 impl DbType {
     /// Detects the database type from a connection URL by examining the scheme prefix.
     ///
-    /// Supports `mysql://`, `mysql+*`, `postgres://`, `postgresql://`, `postgres+*`,
-    /// `sqlite://`, and `sqlite:` schemes. Note: `postgresql+*` variants
-    /// (e.g., `postgresql+unix://`) are not supported; use `postgres+*` instead.
+    /// Supports `mysql://`, `postgres://`, `postgresql://`, `sqlite://`, and `sqlite:`.
+    ///
+    /// `mysql+*` / `postgres+*` (the SQLAlchemy dialect spelling) are deliberately
+    /// rejected: sqlx ignores the scheme entirely when parsing a URL, so
+    /// `mysql+unix:///var/run/mysqld/mysqld.sock` would silently become a TCP
+    /// connection to localhost with `var/run/mysqld/mysqld.sock` as the database
+    /// name. Point a UNIX socket at the engine the way sqlx expects instead:
+    /// `mysql://root@localhost/db?socket=/var/run/mysqld/mysqld.sock` or
+    /// `postgres://user@%2Fvar%2Frun%2Fpostgresql/db`.
     ///
     /// Error messages intentionally include only the scheme portion to avoid leaking
     /// credentials from the URL.
+    ///
+    /// # Errors
+    /// Returns [`AppError::UnsupportedScheme`] when the URL's scheme maps to no
+    /// supported engine. The error carries only the scheme, never the full URL.
     pub fn from_url(url: &str) -> Result<Self, AppError> {
-        if url.starts_with("mysql://") || url.starts_with("mysql+") {
+        if url.starts_with("mysql://") {
             Ok(Self::Mysql)
-        } else if url.starts_with("postgres://")
-            || url.starts_with("postgresql://")
-            || url.starts_with("postgres+")
-        {
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             Ok(Self::Postgres)
         } else if url.starts_with("sqlite://") || url.starts_with("sqlite:") {
             Ok(Self::Sqlite)
@@ -251,97 +260,19 @@ pub struct ExecutionResult {
     pub rows_affected: u64,
 }
 
-/// Converts raw bytes to a UTF-8 string, or a placeholder describing the binary data size.
-fn bytes_to_string(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|e| format!("<binary data: {} bytes>", e.into_bytes().len()))
-}
-
-/// Decodes a single column value, yielding `None` for SQL NULL.
-///
-/// Tries types in order: String, i64, f64, bool, chrono datetimes, Vec<u8>,
-/// then nullable variants. Like `rows_to_values!`, this is a macro to avoid
-/// complex generic trait bounds.
-macro_rules! row_value_to_string {
-    ($row:expr, $index:expr) => {{
-        let row = $row;
-        let index = $index;
-        // Check for NULL first using try_get_raw. Native SQLite driver skips
-        // type checks for null values, which causes String::decode to return ""
-        // instead of failing. Explicit null check prevents this.
-        if row.try_get_raw(index).is_ok_and(|v| v.is_null()) {
-            None
-        // String covers VARCHAR, TEXT, CHAR, ENUM, etc.
-        } else if let Ok(v) = row.try_get::<String, _>(index) {
-            Some(v)
-        } else if let Ok(v) = row.try_get::<i64, _>(index) {
-            Some(v.to_string())
-        } else if let Ok(v) = row.try_get::<f64, _>(index) {
-            Some(v.to_string())
-        } else if let Ok(v) = row.try_get::<bool, _>(index) {
-            Some(v.to_string())
-        // chrono types for TIMESTAMP, DATETIME, DATE, TIME
-        } else if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-            Some(v.to_string())
-        } else if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(index) {
-            Some(v.to_string())
-        } else if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(index) {
-            Some(v.to_string())
-        // BLOB / BYTEA
-        } else if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
-            Some(bytes_to_string(v))
-        // NULL fallbacks — tried after non-Option variants exhaust
-        } else if let Ok(v) = row.try_get::<Option<String>, _>(index) {
-            v
-        } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
-            v.map(|dt| dt.to_string())
-        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
-            v.map(bytes_to_string)
-        } else {
-            let col_name = row.columns().get(index).map_or("<unknown>", |c| c.name());
-            let col_type = row
-                .columns()
-                .get(index)
-                .map(|c| format!("{:?}", c.type_info()))
-                .unwrap_or_default();
-            tracing::warn!(
-                column_index = index,
-                column_name = col_name,
-                column_type = %col_type,
-                "failed to decode column value as any known type"
-            );
-            Some("<error: unsupported type>".to_string())
-        }
-    }};
-}
-
 /// Builds a [`QueryResult`] from a slice of database rows.
-///
-/// Defined as a macro instead of a generic function because the `Row::try_get`
-/// calls require `Decode + Type` bounds for every target type, which are
-/// impractical to express as `where` clauses. The macro is expanded inside
-/// each `with_pool!` arm where the concrete row type is known.
-macro_rules! rows_to_values {
-    ($rows:expr, $truncated:expr) => {{
-        let rows = &$rows;
-        let truncated = $truncated;
-        match rows.first() {
-            // Column metadata is carried by the rows themselves, so an empty
-            // result set cannot report which columns the query selected.
-            None => QueryResult::new(Vec::new(), Vec::new(), truncated),
-            Some(first) => {
-                let columns = first.columns();
-                let names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
-                let values: Vec<Vec<Option<String>>> = rows
-                    .iter()
-                    .map(|row| {
-                        columns.iter().map(|col| row_value_to_string!(row, col.ordinal())).collect()
-                    })
-                    .collect();
-                QueryResult::new(names, values, truncated)
-            }
-        }
-    }};
+fn rows_to_query_result<R: CellDecode>(
+    rows: &[R],
+    truncated: bool,
+) -> Result<QueryResult, sqlx::Error> {
+    // Column metadata is carried by the rows themselves, so an empty
+    // result set cannot report which columns the query selected.
+    let Some(first) = rows.first() else {
+        return Ok(QueryResult::new(Vec::new(), Vec::new(), truncated));
+    };
+    let names = column_names(first);
+    let values = rows.iter().map(decode_row).collect::<Result<Vec<_>, _>>()?;
+    Ok(QueryResult::new(names, values, truncated))
 }
 
 /// A database connection bundling a connection pool with its detected database type.
@@ -357,6 +288,12 @@ impl DatabaseConnection {
     /// Supports the same URL schemes as [`DbType::from_url`]. Connection errors are
     /// wrapped in [`AppError::ConnectionFailed`] to avoid potentially leaking
     /// credentials embedded in the URL through raw sqlx error messages.
+    ///
+    /// # Errors
+    /// Returns [`AppError::UnsupportedScheme`] when the URL's scheme maps to no
+    /// supported engine, or [`AppError::ConnectionFailed`] when the pool cannot
+    /// establish its first connection (host unreachable, authentication rejected,
+    /// unknown database).
     pub async fn connect(url: &str) -> Result<Self, AppError> {
         let db_type = DbType::from_url(url)?;
         let connection_error = |e: sqlx::Error| {
@@ -390,21 +327,25 @@ impl DatabaseConnection {
         self.db_type
     }
 
-    /// Fetches all rows for a SELECT query.
+    /// Streams rows for a SELECT query, keeping at most `max_rows` of them.
+    ///
+    /// The returned [`QueryResult`] reports `truncated` only when a row beyond the
+    /// limit actually exists, so a result of exactly `max_rows` rows is not flagged.
+    /// Each row is decoded as it arrives and the raw row is then dropped, so the raw
+    /// and decoded representations never occupy memory at the same time.
     ///
     /// `sql` is wrapped in [`AssertSqlSafe`] because running caller-supplied SQL is the
-    /// purpose of this server; injection is not a meaningful threat here. Statements are
-    /// instead constrained upstream by [`is_read_query`] (which rejects multi-statement
-    /// input) and [`ValidatedTableName`] (which restricts interpolated identifiers).
-    pub async fn fetch_all(&self, sql: &str) -> Result<QueryResult, sqlx::Error> {
-        with_pool!(&self.pool, |pool| {
-            let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
-            Ok(rows_to_values!(rows, false))
-        })
-    }
-
-    /// Streams rows for a SELECT query, stopping after `max_rows`.
-    /// The returned [`QueryResult`] reports `truncated` when the limit cut the result short.
+    /// purpose of this server; injection is not a meaningful threat here.
+    /// [`crate::sql::is_read_query`] does not gate this call: it only picks the response
+    /// shape for the `execute_sql` tool and never blocks a statement. The resource-read
+    /// path does not forward caller
+    /// SQL at all — it builds `SELECT * FROM {table}` itself, with `{table}` quoted by
+    /// [`DbType::quote_identifier`] from a [`ValidatedTableName`] restricted to
+    /// `[a-zA-Z0-9_]`.
+    ///
+    /// # Errors
+    /// Returns the underlying [`sqlx::Error`] when the statement fails to execute
+    /// or when a returned value cannot be decoded into its string representation.
     pub async fn fetch_streaming(
         &self,
         sql: &str,
@@ -412,22 +353,32 @@ impl DatabaseConnection {
     ) -> Result<QueryResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(pool);
-            let mut rows = Vec::new();
+            let mut columns: Vec<String> = Vec::new();
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
             let mut truncated = false;
             while let Some(row) = stream.try_next().await? {
-                rows.push(row);
-                if rows.len() >= max_rows {
+                if rows.len() == max_rows {
+                    // Reading one row past the limit is what distinguishes a result
+                    // that was cut short from one that merely ends at the limit.
                     truncated = true;
                     break;
                 }
+                if columns.is_empty() {
+                    columns = column_names(&row);
+                }
+                rows.push(decode_row(&row)?);
             }
             drop(stream);
-            Ok(rows_to_values!(rows, truncated))
+            Ok(QueryResult::new(columns, rows, truncated))
         })
     }
 
     /// Fetches the first column of each row as a `String`.
     /// Useful for retrieving table name lists.
+    ///
+    /// # Errors
+    /// Returns the underlying [`sqlx::Error`] when the statement fails to execute,
+    /// or when the first column of a row decodes as neither `String` nor `Vec<u8>`.
     pub async fn fetch_column_as_strings(&self, sql: &str) -> Result<Vec<String>, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
@@ -441,6 +392,10 @@ impl DatabaseConnection {
     }
 
     /// Executes a write/DDL statement, returning the number of affected rows.
+    ///
+    /// # Errors
+    /// Returns the underlying [`sqlx::Error`] when the statement fails to execute
+    /// (syntax error, unknown table, constraint violation).
     pub async fn execute_sql(&self, sql: &str) -> Result<ExecutionResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let result = sqlx::query(AssertSqlSafe(sql)).execute(pool).await?;
@@ -449,6 +404,11 @@ impl DatabaseConnection {
     }
 
     /// Fetches column metadata for the given table.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Database`] when the catalog query fails to execute or a
+    /// returned value cannot be decoded. An unknown table is not an error here: it
+    /// yields an empty [`QueryResult`], which callers report as "not found".
     pub async fn describe_table(
         &self,
         table: &ValidatedTableName,
@@ -457,125 +417,15 @@ impl DatabaseConnection {
         let result = match describe {
             DescribeQuery::Parameterized(sql) => with_pool!(&self.pool, |pool| {
                 let rows = sqlx::query(sql).bind(table.as_str()).fetch_all(pool).await?;
-                Ok::<QueryResult, sqlx::Error>(rows_to_values!(rows, false))
+                rows_to_query_result(&rows, false)
             })?,
             DescribeQuery::Interpolated(sql) => with_pool!(&self.pool, |pool| {
                 let rows = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool).await?;
-                Ok::<QueryResult, sqlx::Error>(rows_to_values!(rows, false))
+                rows_to_query_result(&rows, false)
             })?,
         };
         Ok(result)
     }
-}
-
-/// Strips leading SQL comments (`--` line comments and `/* */` block comments)
-/// from a query string. Returns the remaining SQL with leading whitespace trimmed.
-///
-/// A `--` line comment extends to the next newline or end of input (per SQL standard).
-/// Nested block comments (`/* /* */ */`) are not supported; only the first `*/`
-/// after the opening `/*` is matched. This is safe for downstream classification
-/// since the remnant will not match any read-query prefix.
-/// Returns an error only for unterminated block comments (`/*` without closing `*/`).
-fn strip_leading_sql_comments(sql: &str) -> Result<&str, &'static str> {
-    let mut s = sql.trim_start();
-    loop {
-        if s.starts_with("--") {
-            s = match s.find('\n') {
-                Some(pos) => s[pos + 1..].trim_start(),
-                None => "",
-            };
-        } else if s.starts_with("/*") {
-            s = match s[2..].find("*/") {
-                Some(pos) => s[pos + 4..].trim_start(),
-                None => return Err("unterminated block comment (/* without closing */)"),
-            };
-        } else {
-            break;
-        }
-    }
-    Ok(s)
-}
-
-/// Checks the query for syntactic issues that would cause misclassification.
-///
-/// Currently detects unterminated block comments (`/* ... */`). Call this before
-/// [`is_read_query`] to get a proper error for malformed queries; `is_read_query`
-/// conservatively returns `false` on parse failure.
-pub fn validate_query_syntax(query: &str) -> Result<(), &'static str> {
-    strip_leading_sql_comments(query)?;
-    Ok(())
-}
-
-/// Checks that a keyword at position `0..prefix_len` is followed by a word boundary
-/// (whitespace, `(`, or end of string).
-///
-/// # Panics
-/// Panics if `prefix_len > s.len()`. Callers must ensure
-/// `s.starts_with(keyword)` before calling with `keyword.len()`.
-fn is_keyword_at_boundary(s: &str, prefix_len: usize) -> bool {
-    debug_assert!(prefix_len <= s.len(), "prefix_len exceeds string length");
-    if s.len() == prefix_len {
-        return true;
-    }
-    let next = s.as_bytes()[prefix_len];
-    next.is_ascii_whitespace() || next == b'('
-}
-
-/// Determines whether a SQL query is read-only based on its leading keyword.
-/// WITH (CTE) queries are classified by checking whether a DML keyword
-/// (INSERT, UPDATE, DELETE, MERGE) appears as a standalone token.
-/// Multi-statement queries (containing embedded semicolons) are treated as writes.
-///
-/// Leading SQL comments (`--` and `/* */`) are stripped before classification.
-///
-/// Note: semicolons inside string literals would cause a false rejection,
-/// but this is an acceptable trade-off for preventing multi-statement injection.
-/// Similarly, write keywords appearing inside string literals within a CTE
-/// query would cause a false classification as non-read, which is again
-/// accepted as a conservative safety trade-off.
-pub fn is_read_query(query: &str) -> bool {
-    let no_comments = match strip_leading_sql_comments(query) {
-        Ok(s) => s,
-        // Unterminated comment: conservatively classify as write (non-read).
-        // Callers should use validate_query_syntax() first to get a proper error.
-        Err(_) => return false,
-    };
-    let upper = no_comments.to_uppercase();
-
-    if upper.is_empty() {
-        return false;
-    }
-
-    // Multi-statement queries: reject anything with embedded semicolons.
-    // Trailing semicolons (one or more) are stripped before checking.
-    let stripped = upper.trim_end_matches(';').trim();
-    if stripped.contains(';') {
-        return false;
-    }
-
-    // EXPLAIN always returns plan rows, so we classify it as read for
-    // response-format purposes. EXPLAIN ANALYZE may execute the underlying
-    // query as a side effect, but the response is still a result set.
-    // This means EXPLAIN ANALYZE of DML (e.g., DELETE) will actually execute
-    // the statement, which is accepted since the tool is intended for arbitrary
-    // SQL execution including writes (see `execute_sql` tool in server.rs).
-    const READ_PREFIXES: &[&str] = &["SELECT", "SHOW", "PRAGMA", "DESCRIBE", "EXPLAIN"];
-
-    if READ_PREFIXES
-        .iter()
-        .any(|p| stripped.starts_with(p) && is_keyword_at_boundary(stripped, p.len()))
-    {
-        return true;
-    }
-
-    if stripped.starts_with("WITH") && is_keyword_at_boundary(stripped, 4) {
-        const WRITE_KEYWORDS: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE"];
-        return !WRITE_KEYWORDS
-            .iter()
-            .any(|kw| stripped.split_whitespace().any(|word| word == *kw));
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -756,159 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_read_query() {
-        assert!(is_read_query("SELECT * FROM users"));
-        assert!(is_read_query("  select * from users  "));
-        assert!(is_read_query("SHOW TABLES"));
-        assert!(is_read_query("PRAGMA table_info('users')"));
-        assert!(is_read_query("EXPLAIN SELECT 1"));
-        assert!(is_read_query("DESCRIBE users"));
-        assert!(is_read_query("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+    fn test_db_type_from_url_rejects_plus_schemes() {
+        // sqlx never looks at the scheme, so accepting these would connect
+        // somewhere the caller did not ask for instead of failing.
+        let err = DbType::from_url("mysql+unix:///var/run/mysqld/mysqld.sock").unwrap_err();
+        assert!(err.to_string().contains("mysql+unix"), "error should name the scheme");
 
-        assert!(!is_read_query("INSERT INTO users VALUES (1)"));
-        assert!(!is_read_query("UPDATE users SET name = 'x'"));
-        assert!(!is_read_query("DELETE FROM users"));
-    }
-
-    #[test]
-    fn test_is_read_query_trailing_semicolon() {
-        assert!(is_read_query("SELECT * FROM users;"));
-        assert!(is_read_query("SELECT * FROM users ;"));
-    }
-
-    #[test]
-    fn test_is_read_query_multi_statement() {
-        assert!(!is_read_query("SELECT 1; DROP TABLE users"));
-        assert!(!is_read_query("SELECT 1; SELECT 2"));
-    }
-
-    #[test]
-    fn test_is_read_query_empty_and_whitespace() {
-        assert!(!is_read_query(""));
-        assert!(!is_read_query("   "));
-        assert!(!is_read_query("\t\n"));
-    }
-
-    #[test]
-    fn test_is_read_query_ddl() {
-        assert!(!is_read_query("CREATE TABLE t (id INT)"));
-        assert!(!is_read_query("ALTER TABLE t ADD COLUMN x INT"));
-        assert!(!is_read_query("DROP TABLE t"));
-    }
-
-    #[test]
-    fn test_is_read_query_cte_with_dml() {
-        assert!(!is_read_query("WITH cte AS (SELECT 1) INSERT INTO users SELECT * FROM cte"));
-        assert!(!is_read_query("WITH cte AS (SELECT 1) UPDATE users SET id = 1"));
-        assert!(!is_read_query("WITH cte AS (SELECT 1) DELETE FROM users"));
-    }
-
-    #[test]
-    fn test_is_read_query_explain_analyze() {
-        assert!(is_read_query("EXPLAIN ANALYZE SELECT 1"));
-        assert!(is_read_query("EXPLAIN ANALYZE DELETE FROM users"));
-    }
-
-    #[test]
-    fn test_is_read_query_multiple_trailing_semicolons() {
-        assert!(is_read_query("SELECT 1;;;"));
-        // Spaces between semicolons are treated as embedded semicolons (multi-statement).
-        assert!(!is_read_query("SELECT 1;  ;"));
-    }
-
-    #[test]
-    fn test_is_read_query_sql_comments() {
-        assert!(is_read_query("-- comment\nSELECT 1"));
-        assert!(is_read_query("/* block comment */ SELECT 1"));
-        assert!(is_read_query("-- line1\n-- line2\nSELECT 1"));
-        assert!(is_read_query("/* comment */ -- another\nSELECT 1"));
-        assert!(!is_read_query("-- comment\nINSERT INTO t VALUES (1)"));
-    }
-
-    #[test]
-    fn test_is_read_query_word_boundary() {
-        assert!(!is_read_query("SELECTFOO"));
-        assert!(is_read_query("SELECT(1)"));
-        assert!(!is_read_query("SHOWING"));
-        assert!(is_read_query("SHOW TABLES"));
-    }
-
-    #[test]
-    fn test_db_type_from_url_mysql_plus_scheme() {
-        assert_eq!(
-            DbType::from_url("mysql+unix:///var/run/mysqld/mysqld.sock").unwrap(),
-            DbType::Mysql
-        );
-    }
-
-    #[test]
-    fn test_db_type_from_url_postgres_plus_scheme() {
-        assert_eq!(
-            DbType::from_url("postgres+unix:///var/run/postgresql").unwrap(),
-            DbType::Postgres
-        );
-    }
-
-    #[test]
-    fn test_bytes_to_string_valid_utf8() {
-        let s = bytes_to_string(b"hello".to_vec());
-        assert_eq!(s, "hello");
-    }
-
-    #[test]
-    fn test_bytes_to_string_invalid_utf8() {
-        let s = bytes_to_string(vec![0xFF, 0xFE, 0xFD]);
-        assert!(s.contains("binary data"));
-        assert!(s.contains("3 bytes"));
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_line_comment() {
-        assert_eq!(strip_leading_sql_comments("-- comment\nSELECT 1"), Ok("SELECT 1"));
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_block_comment() {
-        assert_eq!(strip_leading_sql_comments("/* comment */ SELECT 1"), Ok("SELECT 1"));
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_no_comment() {
-        assert_eq!(strip_leading_sql_comments("SELECT 1"), Ok("SELECT 1"));
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_unterminated_block() {
-        assert!(strip_leading_sql_comments("/* unterminated").is_err());
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_slash_star_slash_is_unterminated() {
-        // "/*/" is an unterminated block comment, NOT a zero-length comment.
-        // The `*/` at positions 1-2 overlaps with the opening `/*` at positions 0-1,
-        // so it must not be treated as a closing delimiter.
-        assert!(strip_leading_sql_comments("/*/ SELECT 1").is_err());
-    }
-
-    #[test]
-    fn test_strip_leading_sql_comments_line_comment_no_newline() {
-        // Per SQL standard, `--` extends to end of input when there is no newline.
-        assert_eq!(strip_leading_sql_comments("-- no newline"), Ok(""));
-    }
-
-    #[test]
-    fn test_validate_query_syntax() {
-        assert!(validate_query_syntax("SELECT 1").is_ok());
-        assert!(validate_query_syntax("-- comment\nSELECT 1").is_ok());
-        assert!(validate_query_syntax("-- no newline").is_ok());
-        assert!(validate_query_syntax("/* unterminated").is_err());
-    }
-
-    #[test]
-    fn test_is_keyword_at_boundary() {
-        assert!(is_keyword_at_boundary("SELECT 1", 6));
-        assert!(is_keyword_at_boundary("SELECT(1)", 6));
-        assert!(is_keyword_at_boundary("SELECT", 6));
-        assert!(!is_keyword_at_boundary("SELECTFOO", 6));
+        let err = DbType::from_url("postgres+unix:///var/run/postgresql").unwrap_err();
+        assert!(err.to_string().contains("postgres+unix"), "error should name the scheme");
     }
 }
