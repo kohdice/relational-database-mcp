@@ -9,6 +9,12 @@ It exposes MCP tools for accessing relational databases (MySQL, PostgreSQL, SQLi
 using the [`rmcp`](https://crates.io/crates/rmcp) official Rust SDK. Keep `rmcp` on its latest
 release and follow the latest MCP specification when implementing or changing tools.
 
+- MCP protocol version advertised: `2026-07-28`. `ProtocolVersion::LATEST` in rmcp still points
+  at `2025-11-25`, so the version is named explicitly in `get_info()`; older clients are handled
+  by rmcp's version negotiation.
+- Tool output: every tool declares an output schema and returns JSON via `structuredContent`.
+  Return `Json<T>` from the tool method so rmcp derives the schema and emits both the structured
+  and text halves of the result. Do not add new CSV or free-text output formats.
 - Rust toolchain: `1.97` (`channel` in `rust-toolchain.toml`)
 - Edition: `2024` (`edition` in workspace `Cargo.toml`; MSRV `rust-version = "1.97"`, also mirrored in `clippy.toml` `msrv`)
 - Workspace layout: a Cargo workspace (`resolver = "3"`) with members under `crates/*`:
@@ -43,15 +49,18 @@ just check       # fmt + lint
 just check-ci    # fmt-check + lint (CI order)
 ```
 
-Underlying cargo commands and aliases (`.cargo/config.toml`):
+Underlying cargo commands:
 
 ```bash
-cargo build                  # Build the whole workspace (alias: cargo b)
-cargo test                   # Run all unit/integration tests (alias: cargo t)
+cargo build                  # Build the whole workspace
+cargo build --release -p rdb-mcp   # Build the stdio server binary (target/release/rdb-mcp)
+cargo test                   # Run all unit/integration tests
 cargo fmt                    # Run the rustfmt formatter (uses rustfmt.toml)
 cargo fmt --check            # Format check (run before pushing)
 cargo lint                   # Alias for `clippy --workspace --all-targets -- -D warnings`
 ```
+
+`lint` is the only alias defined in `.cargo/config.toml`.
 
 A CI pipeline is not yet wired up in this repository; when one is added, it must run `just check-ci` (or stay in sync with it).
 
