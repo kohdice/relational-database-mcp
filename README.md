@@ -15,7 +15,7 @@ Built with Rust using [rmcp](https://github.com/modelcontextprotocol/rust-sdk) a
 
 ### Prerequisites
 
-- Rust 1.92+
+- Rust 1.97+
 
 ### Build from source
 

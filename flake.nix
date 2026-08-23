@@ -1,10 +1,13 @@
 {
-  description = "relational-database-mcp";
+  description = "Development environment for Relational Database MCP";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -13,7 +16,6 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
-      ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -22,27 +24,18 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        rust = pkgs.rust-bin.stable."1.92.0".default.override {
-          extensions = [
-            "rust-src"
-            "rust-analyzer"
-            "rustfmt"
-            "clippy"
-          ];
-        };
+
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in
       {
         devShells.default = pkgs.mkShell {
-          name = "relational-database-mcp";
+          name = "rdb-mcp";
 
-          nativeBuildInputs = with pkgs; [
-            rust
-            cargo-deny
-            pkg-config
+          packages = with pkgs; [ 
+            just
+            rustToolchain
           ];
         };
-
-        formatter = pkgs.nixfmt-rfc-style;
       }
     );
 }

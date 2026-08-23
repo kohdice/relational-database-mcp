@@ -1,8 +1,2 @@
 [alias]
-b = "build"
-c = "check"
-f = "fmt"
-l = "clippy"
-t = "test"
-r = "run"
-rr = "run --release"
+lint = "clippy --workspace --all-targets -- -D warnings"
