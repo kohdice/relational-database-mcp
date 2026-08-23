@@ -59,6 +59,16 @@ rdb-mcp --database-url "postgres://user:pass@localhost:5432/mydb"
 rdb-mcp --database-url "sqlite:./data.db"
 ```
 
+To reach a server over a UNIX socket, pass it the way `sqlx` expects — `mysql+unix://` and `postgres+unix://` are not supported, because they would silently resolve to a TCP connection:
+
+```bash
+# MySQL: the socket path goes in a query parameter
+rdb-mcp --database-url "mysql://user@localhost/mydb?socket=/var/run/mysqld/mysqld.sock"
+
+# PostgreSQL: the socket directory goes in the host, percent-encoded
+rdb-mcp --database-url "postgres://user@%2Fvar%2Frun%2Fpostgresql/mydb"
+```
+
 ## MCP Client Configuration
 
 ### Claude Desktop
@@ -105,14 +115,16 @@ All tools return JSON as `structuredContent`, alongside the same JSON serialized
 
 Read queries and `describe_table` share one shape:
 
-| Field       | Type                       | Description                                                                                         |
-| ----------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
-| `columns`   | `string[]`                 | Column names in the order the database returned them. Empty when no rows were returned, because column metadata comes from the rows themselves. |
-| `rows`      | `(string \| null)[][]`     | One entry per row, holding one value per column. `null` means SQL NULL.                              |
-| `row_count` | `number`                   | Number of entries in `rows`.                                                                          |
-| `truncated` | `boolean`                  | `true` when the result was cut off at the row limit.                                                  |
+| Field       | Type                   | Description                                                                                                                                     |
+| ----------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `columns`   | `string[]`             | Column names in the order the database returned them. Empty when no rows were returned, because column metadata comes from the rows themselves. |
+| `rows`      | `(string \| null)[][]` | One entry per row, holding one value per column. `null` means SQL NULL.                                                                         |
+| `row_count` | `number`               | Number of entries in `rows`.                                                                                                                    |
+| `truncated` | `boolean`              | `true` when the result was cut off at the row limit.                                                                                            |
 
-Values are returned as strings so that engine-specific types (fixed-point decimals, dates, unsigned integers) survive without lossy conversion. Binary values that are not valid UTF-8 are replaced by `<binary data: N bytes>`.
+Values are returned as strings so that engine-specific types (fixed-point decimals, dates, unsigned integers) survive without lossy conversion. Binary values that are not valid UTF-8 are base64-encoded behind a `base64:` prefix, so the original bytes can be recovered.
+
+Each SQL type is decoded through exactly one Rust type, chosen from the type the database reports for the value. A column whose type has no mapping fails the call rather than returning a placeholder; cast it in the query (`CAST(col AS CHAR)` on MySQL, `col::text` on PostgreSQL) to read it as text.
 
 ### `execute_sql`
 
@@ -144,7 +156,9 @@ execute_sql({ "query": "INSERT INTO users (name) VALUES ('Charlie')" })
 
 ### `list_tables`
 
-List all tables in the database. No parameters required.
+List tables in the database's default user-facing schema. No parameters required.
+
+The scope is engine-specific: MySQL lists the current database, PostgreSQL lists the `public` schema only, and SQLite lists non-system tables.
 
 ```jsonc
 list_tables()
@@ -177,11 +191,11 @@ Table names are validated to contain only alphanumeric characters and underscore
 
 Each table in the database is exposed as an MCP resource.
 
-| Property   | Value                                                            |
-| ---------- | ---------------------------------------------------------------- |
-| URI format | `{scheme}://{table_name}/data`                                   |
-| MIME type  | `application/json`                                               |
-| Content    | `SELECT * FROM {table} LIMIT 100`, in the result set shape above |
+| Property   | Value                                                                                                       |
+| ---------- | ----------------------------------------------------------------------------------------------------------- |
+| URI format | `{scheme}://{table_name}/data`                                                                              |
+| MIME type  | `application/json`                                                                                          |
+| Content    | The table's first 100 rows, in the result set shape above. `truncated` is `true` when the table holds more. |
 
 For example, a `users` table in a MySQL database is available at `mysql://users/data`.
 
