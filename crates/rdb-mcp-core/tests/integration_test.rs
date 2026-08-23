@@ -32,56 +32,66 @@ async fn setup_db() -> DatabaseConnection {
     db
 }
 
+/// Convenience for asserting on a single cell without repeating the Option/&str dance.
+fn cell(rows: &[Vec<Option<String>>], row: usize, column: usize) -> Option<&str> {
+    rows[row][column].as_deref()
+}
+
 #[tokio::test]
-async fn test_select_query_returns_csv() {
+async fn test_select_query_returns_columns_and_rows() {
     let db = setup_db().await;
 
-    let csv = db.fetch_all_as_csv("SELECT id, name, email FROM users ORDER BY id").await.unwrap();
+    let result = db.fetch_all("SELECT id, name, email FROM users ORDER BY id").await.unwrap();
 
-    assert!(csv.contains("id,name,email"));
-    assert!(csv.contains("1,Alice,alice@example.com"));
-    assert!(csv.contains("2,Bob,bob@example.com"));
+    assert_eq!(result.columns, vec!["id", "name", "email"]);
+    assert_eq!(result.row_count, 2);
+    assert!(!result.truncated);
+    assert_eq!(cell(&result.rows, 0, 0), Some("1"));
+    assert_eq!(cell(&result.rows, 0, 1), Some("Alice"));
+    assert_eq!(cell(&result.rows, 0, 2), Some("alice@example.com"));
+    assert_eq!(cell(&result.rows, 1, 1), Some("Bob"));
+    assert_eq!(cell(&result.rows, 1, 2), Some("bob@example.com"));
 }
 
 #[tokio::test]
 async fn test_insert_affects_rows() {
     let db = setup_db().await;
 
-    let affected = db
+    let result = db
         .execute_sql(
             "INSERT INTO users (id, name, email) VALUES (3, 'Charlie', 'charlie@example.com')",
         )
         .await
         .unwrap();
 
-    assert_eq!(affected, 1);
+    assert_eq!(result.rows_affected, 1);
 
-    let csv = db.fetch_all_as_csv("SELECT COUNT(*) as cnt FROM users").await.unwrap();
-    assert!(csv.contains("3"));
+    let count = db.fetch_all("SELECT COUNT(*) as cnt FROM users").await.unwrap();
+    assert_eq!(cell(&count.rows, 0, 0), Some("3"));
 }
 
 #[tokio::test]
 async fn test_update_affects_rows() {
     let db = setup_db().await;
 
-    let affected = db
+    let result = db
         .execute_sql("UPDATE users SET email = 'updated@example.com' WHERE id = 1")
         .await
         .unwrap();
 
-    assert_eq!(affected, 1);
+    assert_eq!(result.rows_affected, 1);
 }
 
 #[tokio::test]
 async fn test_delete_affects_rows() {
     let db = setup_db().await;
 
-    let affected = db.execute_sql("DELETE FROM users WHERE id = 2").await.unwrap();
+    let result = db.execute_sql("DELETE FROM users WHERE id = 2").await.unwrap();
 
-    assert_eq!(affected, 1);
+    assert_eq!(result.rows_affected, 1);
 
-    let csv = db.fetch_all_as_csv("SELECT COUNT(*) as cnt FROM users").await.unwrap();
-    assert!(csv.contains("1"));
+    let count = db.fetch_all("SELECT COUNT(*) as cnt FROM users").await.unwrap();
+    assert_eq!(cell(&count.rows, 0, 0), Some("1"));
 }
 
 #[tokio::test]
@@ -99,45 +109,91 @@ async fn test_describe_table_sqlite() {
     let db = setup_db().await;
 
     let table = db::ValidatedTableName::new("users").unwrap();
-    let csv = db.describe_table_as_csv(&table).await.unwrap();
+    let result = db.describe_table(&table).await.unwrap();
 
-    assert!(csv.contains("name"));
-    assert!(csv.contains("id"));
-    assert!(csv.contains("email"));
+    // PRAGMA table_info returns one row per column, with the column name in `name`.
+    let name_index = result.columns.iter().position(|c| c == "name").unwrap();
+    let described: Vec<Option<&str>> =
+        result.rows.iter().map(|row| row[name_index].as_deref()).collect();
+    assert_eq!(described, vec![Some("id"), Some("name"), Some("email")]);
 }
 
 #[tokio::test]
-async fn test_fetch_all_as_csv_empty() {
+async fn test_fetch_all_empty_result() {
     let db = setup_db().await;
 
     db.execute_sql("DELETE FROM users").await.unwrap();
-    let csv = db.fetch_all_as_csv("SELECT * FROM users").await.unwrap();
-    assert_eq!(csv, "");
+    let result = db.fetch_all("SELECT * FROM users").await.unwrap();
+
+    assert!(result.is_empty());
+    assert_eq!(result.row_count, 0);
+    assert!(result.rows.is_empty());
+    // Column metadata comes from the returned rows, so an empty result set has none.
+    assert!(result.columns.is_empty());
 }
 
 #[tokio::test]
-async fn test_csv_with_null_values() {
+async fn test_null_values_decode_to_none() {
     let db = setup_db().await;
 
     db.execute_sql("INSERT INTO users (id, name, email) VALUES (3, 'NoEmail', NULL)")
         .await
         .unwrap();
 
-    let csv = db.fetch_all_as_csv("SELECT id, name, email FROM users WHERE id = 3").await.unwrap();
+    let result = db.fetch_all("SELECT id, name, email FROM users WHERE id = 3").await.unwrap();
 
-    assert!(csv.contains("id,name,email"));
-    assert!(csv.contains("3,NoEmail,NULL"));
+    assert_eq!(result.columns, vec!["id", "name", "email"]);
+    assert_eq!(result.row_count, 1);
+    assert_eq!(cell(&result.rows, 0, 1), Some("NoEmail"));
+    assert_eq!(cell(&result.rows, 0, 2), None);
 }
 
 #[tokio::test]
-async fn test_resource_read_csv_format() {
+async fn test_fetch_streaming_truncates_at_max_rows() {
     let db = setup_db().await;
 
-    let csv = db.fetch_all_as_csv("SELECT * FROM users LIMIT 100").await.unwrap();
+    let result = db.fetch_streaming("SELECT id FROM users ORDER BY id", 1).await.unwrap();
 
-    assert!(csv.starts_with("id,name,email"));
-    let lines: Vec<&str> = csv.lines().collect();
-    assert_eq!(lines.len(), 3); // header + 2 data rows
+    assert!(result.truncated);
+    assert_eq!(result.row_count, 1);
+    assert_eq!(cell(&result.rows, 0, 0), Some("1"));
+}
+
+#[tokio::test]
+async fn test_fetch_streaming_not_truncated_under_limit() {
+    let db = setup_db().await;
+
+    let result = db.fetch_streaming("SELECT id FROM users ORDER BY id", 10).await.unwrap();
+
+    assert!(!result.truncated);
+    assert_eq!(result.row_count, 2);
+}
+
+#[tokio::test]
+async fn test_resource_read_shape() {
+    let db = setup_db().await;
+
+    let result = db.fetch_all("SELECT * FROM users LIMIT 100").await.unwrap();
+
+    assert_eq!(result.columns, vec!["id", "name", "email"]);
+    assert_eq!(result.row_count, 2);
+}
+
+#[tokio::test]
+async fn test_query_result_serializes_null_as_json_null() {
+    let db = setup_db().await;
+
+    db.execute_sql("INSERT INTO users (id, name, email) VALUES (3, 'NoEmail', NULL)")
+        .await
+        .unwrap();
+
+    let result = db.fetch_all("SELECT email FROM users WHERE id = 3").await.unwrap();
+    let json = serde_json::to_value(&result).unwrap();
+
+    assert_eq!(json["columns"], serde_json::json!(["email"]));
+    assert_eq!(json["rows"], serde_json::json!([[serde_json::Value::Null]]));
+    assert_eq!(json["row_count"], 1);
+    assert_eq!(json["truncated"], false);
 }
 
 #[tokio::test]
@@ -173,19 +229,19 @@ async fn test_database_connection_invalid_url() {
 #[tokio::test]
 async fn test_query_nonexistent_table() {
     let db = setup_db().await;
-    let result = db.fetch_all_as_csv("SELECT * FROM nonexistent_table").await;
+    let result = db.fetch_all("SELECT * FROM nonexistent_table").await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_query_syntax_error() {
     let db = setup_db().await;
-    let result = db.fetch_all_as_csv("SELEC * FORM users").await;
+    let result = db.fetch_all("SELEC * FORM users").await;
     assert!(result.is_err());
 }
 
 #[tokio::test]
-async fn test_csv_f64_column() {
+async fn test_f64_column() {
     let db = setup_db().await;
 
     db.execute_sql("CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL NOT NULL)")
@@ -193,39 +249,43 @@ async fn test_csv_f64_column() {
         .unwrap();
     db.execute_sql("INSERT INTO prices (id, amount) VALUES (1, 9.99)").await.unwrap();
 
-    let csv = db.fetch_all_as_csv("SELECT id, amount FROM prices").await.unwrap();
-    assert!(csv.contains("id,amount"));
-    assert!(csv.contains("9.99"));
+    let result = db.fetch_all("SELECT id, amount FROM prices").await.unwrap();
+
+    assert_eq!(result.columns, vec!["id", "amount"]);
+    assert_eq!(cell(&result.rows, 0, 1), Some("9.99"));
 }
 
 #[tokio::test]
-async fn test_csv_blob_valid_utf8() {
+async fn test_blob_valid_utf8() {
     let db = setup_db().await;
 
     db.execute_sql("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)").await.unwrap();
     db.execute_sql("INSERT INTO blobs (id, data) VALUES (1, X'68656C6C6F')").await.unwrap();
 
-    let csv = db.fetch_all_as_csv("SELECT id, data FROM blobs").await.unwrap();
-    assert!(csv.contains("hello"));
+    let result = db.fetch_all("SELECT id, data FROM blobs").await.unwrap();
+
+    assert_eq!(cell(&result.rows, 0, 1), Some("hello"));
 }
 
 #[tokio::test]
-async fn test_csv_blob_invalid_utf8() {
+async fn test_blob_invalid_utf8() {
     let db = setup_db().await;
 
     db.execute_sql("CREATE TABLE blobs2 (id INTEGER PRIMARY KEY, data BLOB)").await.unwrap();
     db.execute_sql("INSERT INTO blobs2 (id, data) VALUES (1, X'FFFEFD')").await.unwrap();
 
-    let csv = db.fetch_all_as_csv("SELECT id, data FROM blobs2").await.unwrap();
-    assert!(csv.contains("binary data"));
+    let result = db.fetch_all("SELECT id, data FROM blobs2").await.unwrap();
+
+    assert_eq!(cell(&result.rows, 0, 1), Some("<binary data: 3 bytes>"));
 }
 
 #[tokio::test]
 async fn test_describe_table_dispatch_sqlite() {
     let db = setup_db().await;
     let table = db::ValidatedTableName::new("users").unwrap();
-    let csv = db.describe_table_as_csv(&table).await.unwrap();
+    let result = db.describe_table(&table).await.unwrap();
 
-    assert!(csv.contains("id"));
-    assert!(csv.contains("name"));
+    assert!(!result.is_empty());
+    assert!(result.columns.iter().any(|c| c == "name"));
+    assert!(result.columns.iter().any(|c| c == "type"));
 }

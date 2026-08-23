@@ -1,12 +1,13 @@
 //! Database abstraction layer for MySQL, PostgreSQL, and SQLite.
 //!
 //! Provides database type detection, connection management, SQL query classification,
-//! table name validation, and CSV serialization of query results.
+//! table name validation, and decoding of query results into serializable data.
 
-use std::borrow::Cow;
 use std::fmt;
 
 use futures_util::TryStreamExt;
+use schemars::JsonSchema;
+use serde::Serialize;
 use sqlx::{AssertSqlSafe, Column, Row, ValueRef};
 
 use crate::error::AppError;
@@ -216,15 +217,38 @@ impl fmt::Display for ValidatedTableName {
     }
 }
 
-/// Escapes a CSV field according to RFC 4180: fields containing commas,
-/// double quotes, newlines (`\n`), or carriage returns (`\r`) are enclosed
-/// in double quotes, with internal double quotes doubled.
-fn escape_csv_field(field: &str) -> Cow<'_, str> {
-    if field.contains([',', '"', '\n', '\r']) {
-        Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
-    } else {
-        Cow::Borrowed(field)
+/// Result of a read query, as column names plus row values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct QueryResult {
+    /// Column names, in the order the database returned them.
+    /// Empty when the query produced no rows, because column metadata is
+    /// only available from a returned row.
+    pub columns: Vec<String>,
+    /// Each row holds one decoded value per column; `None` represents SQL NULL.
+    pub rows: Vec<Vec<Option<String>>>,
+    /// Number of rows in `rows`.
+    pub row_count: usize,
+    /// True when the result was cut off at the row limit.
+    pub truncated: bool,
+}
+
+impl QueryResult {
+    /// Builds a result from decoded columns and rows, deriving `row_count` from `rows`.
+    fn new(columns: Vec<String>, rows: Vec<Vec<Option<String>>>, truncated: bool) -> Self {
+        Self { columns, row_count: rows.len(), rows, truncated }
     }
+
+    /// Returns true when the query produced no rows.
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+}
+
+/// Result of a write or DDL statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ExecutionResult {
+    /// Number of rows the statement inserted, updated, or deleted.
+    pub rows_affected: u64,
 }
 
 /// Converts raw bytes to a UTF-8 string, or a placeholder describing the binary data size.
@@ -233,10 +257,10 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|e| format!("<binary data: {} bytes>", e.into_bytes().len()))
 }
 
-/// Decodes a single column value to a string representation.
+/// Decodes a single column value, yielding `None` for SQL NULL.
 ///
 /// Tries types in order: String, i64, f64, bool, chrono datetimes, Vec<u8>,
-/// then nullable variants. Like `rows_to_csv!`, this is a macro to avoid
+/// then nullable variants. Like `rows_to_values!`, this is a macro to avoid
 /// complex generic trait bounds.
 macro_rules! row_value_to_string {
     ($row:expr, $index:expr) => {{
@@ -246,33 +270,33 @@ macro_rules! row_value_to_string {
         // type checks for null values, which causes String::decode to return ""
         // instead of failing. Explicit null check prevents this.
         if row.try_get_raw(index).is_ok_and(|v| v.is_null()) {
-            "NULL".to_string()
+            None
         // String covers VARCHAR, TEXT, CHAR, ENUM, etc.
         } else if let Ok(v) = row.try_get::<String, _>(index) {
-            v
+            Some(v)
         } else if let Ok(v) = row.try_get::<i64, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         } else if let Ok(v) = row.try_get::<f64, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         } else if let Ok(v) = row.try_get::<bool, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         // chrono types for TIMESTAMP, DATETIME, DATE, TIME
         } else if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         } else if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         } else if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(index) {
-            v.to_string()
+            Some(v.to_string())
         // BLOB / BYTEA
         } else if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
-            bytes_to_string(v)
+            Some(bytes_to_string(v))
         // NULL fallbacks — tried after non-Option variants exhaust
         } else if let Ok(v) = row.try_get::<Option<String>, _>(index) {
-            v.unwrap_or_else(|| "NULL".to_string())
+            v
         } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(index) {
-            v.map_or_else(|| "NULL".to_string(), |dt| dt.to_string())
+            v.map(|dt| dt.to_string())
         } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(index) {
-            v.map_or_else(|| "NULL".to_string(), bytes_to_string)
+            v.map(bytes_to_string)
         } else {
             let col_name = row.columns().get(index).map_or("<unknown>", |c| c.name());
             let col_type = row
@@ -286,44 +310,36 @@ macro_rules! row_value_to_string {
                 column_type = %col_type,
                 "failed to decode column value as any known type"
             );
-            "<error: unsupported type>".to_string()
+            Some("<error: unsupported type>".to_string())
         }
     }};
 }
 
-/// Generates CSV from a slice of database rows.
+/// Builds a [`QueryResult`] from a slice of database rows.
 ///
 /// Defined as a macro instead of a generic function because the `Row::try_get`
 /// calls require `Decode + Type` bounds for every target type, which are
 /// impractical to express as `where` clauses. The macro is expanded inside
 /// each `with_pool!` arm where the concrete row type is known.
-macro_rules! rows_to_csv {
-    ($rows:expr) => {{
+macro_rules! rows_to_values {
+    ($rows:expr, $truncated:expr) => {{
         let rows = &$rows;
-        if rows.is_empty() {
-            String::new()
-        } else {
-            let columns = rows[0].columns();
-            let mut csv = String::new();
-
-            for (i, col) in columns.iter().enumerate() {
-                if i > 0 {
-                    csv.push(',');
-                }
-                csv.push_str(&escape_csv_field(col.name()));
+        let truncated = $truncated;
+        match rows.first() {
+            // Column metadata is carried by the rows themselves, so an empty
+            // result set cannot report which columns the query selected.
+            None => QueryResult::new(Vec::new(), Vec::new(), truncated),
+            Some(first) => {
+                let columns = first.columns();
+                let names: Vec<String> = columns.iter().map(|c| c.name().to_string()).collect();
+                let values: Vec<Vec<Option<String>>> = rows
+                    .iter()
+                    .map(|row| {
+                        columns.iter().map(|col| row_value_to_string!(row, col.ordinal())).collect()
+                    })
+                    .collect();
+                QueryResult::new(names, values, truncated)
             }
-
-            for row in rows.iter() {
-                csv.push('\n');
-                for (i, col) in columns.iter().enumerate() {
-                    if i > 0 {
-                        csv.push(',');
-                    }
-                    csv.push_str(&escape_csv_field(&row_value_to_string!(row, col.ordinal())));
-                }
-            }
-
-            csv
         }
     }};
 }
@@ -374,26 +390,26 @@ impl DatabaseConnection {
         self.db_type
     }
 
-    /// Fetches all rows for a SELECT query and returns the result as CSV.
+    /// Fetches all rows for a SELECT query.
     ///
     /// `sql` is wrapped in [`AssertSqlSafe`] because running caller-supplied SQL is the
     /// purpose of this server; injection is not a meaningful threat here. Statements are
     /// instead constrained upstream by [`is_read_query`] (which rejects multi-statement
     /// input) and [`ValidatedTableName`] (which restricts interpolated identifiers).
-    pub async fn fetch_all_as_csv(&self, sql: &str) -> Result<String, sqlx::Error> {
+    pub async fn fetch_all(&self, sql: &str) -> Result<QueryResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
-            Ok(rows_to_csv!(rows))
+            Ok(rows_to_values!(rows, false))
         })
     }
 
-    /// Streams rows for a SELECT query and returns CSV, stopping after `max_rows`.
-    /// Returns `(csv, truncated)` where `truncated` indicates if more rows exist.
-    pub async fn fetch_streaming_as_csv(
+    /// Streams rows for a SELECT query, stopping after `max_rows`.
+    /// The returned [`QueryResult`] reports `truncated` when the limit cut the result short.
+    pub async fn fetch_streaming(
         &self,
         sql: &str,
         max_rows: usize,
-    ) -> Result<(String, bool), sqlx::Error> {
+    ) -> Result<QueryResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(pool);
             let mut rows = Vec::new();
@@ -406,7 +422,7 @@ impl DatabaseConnection {
                 }
             }
             drop(stream);
-            Ok((rows_to_csv!(rows), truncated))
+            Ok(rows_to_values!(rows, truncated))
         })
     }
 
@@ -424,31 +440,31 @@ impl DatabaseConnection {
         })
     }
 
-    /// Executes a write/DDL query, returning the number of affected rows.
-    pub async fn execute_sql(&self, sql: &str) -> Result<u64, sqlx::Error> {
+    /// Executes a write/DDL statement, returning the number of affected rows.
+    pub async fn execute_sql(&self, sql: &str) -> Result<ExecutionResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
             let result = sqlx::query(AssertSqlSafe(sql)).execute(pool).await?;
-            Ok(result.rows_affected())
+            Ok(ExecutionResult { rows_affected: result.rows_affected() })
         })
     }
 
-    /// Fetches column metadata for the given table and returns it as CSV.
-    pub async fn describe_table_as_csv(
+    /// Fetches column metadata for the given table.
+    pub async fn describe_table(
         &self,
         table: &ValidatedTableName,
-    ) -> Result<String, AppError> {
+    ) -> Result<QueryResult, AppError> {
         let describe = self.db_type.describe_table_query(table);
-        let csv = match describe {
+        let result = match describe {
             DescribeQuery::Parameterized(sql) => with_pool!(&self.pool, |pool| {
                 let rows = sqlx::query(sql).bind(table.as_str()).fetch_all(pool).await?;
-                Ok::<String, sqlx::Error>(rows_to_csv!(rows))
+                Ok::<QueryResult, sqlx::Error>(rows_to_values!(rows, false))
             })?,
             DescribeQuery::Interpolated(sql) => with_pool!(&self.pool, |pool| {
                 let rows = sqlx::query(AssertSqlSafe(sql.as_str())).fetch_all(pool).await?;
-                Ok::<String, sqlx::Error>(rows_to_csv!(rows))
+                Ok::<QueryResult, sqlx::Error>(rows_to_values!(rows, false))
             })?,
         };
-        Ok(csv)
+        Ok(result)
     }
 }
 
@@ -764,15 +780,6 @@ mod tests {
     fn test_is_read_query_multi_statement() {
         assert!(!is_read_query("SELECT 1; DROP TABLE users"));
         assert!(!is_read_query("SELECT 1; SELECT 2"));
-    }
-
-    #[test]
-    fn test_escape_csv_field() {
-        assert_eq!(escape_csv_field("hello"), "hello");
-        assert_eq!(escape_csv_field("hello,world"), "\"hello,world\"");
-        assert_eq!(escape_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(escape_csv_field("line1\nline2"), "\"line1\nline2\"");
-        assert_eq!(escape_csv_field(""), "");
     }
 
     #[test]

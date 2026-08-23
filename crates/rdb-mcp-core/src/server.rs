@@ -4,14 +4,17 @@
 //! an MCP resource interface for browsing table data.
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, handler::server::tool::ToolRouter,
-    handler::server::wrapper::Parameters, model::*, service::RequestContext, tool, tool_handler,
-    tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::tool::ToolRouter,
+    handler::server::wrapper::{Json, Parameters},
+    model::*,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::db::{self, DatabaseConnection, ValidatedTableName};
+use crate::db::{self, DatabaseConnection, ExecutionResult, QueryResult, ValidatedTableName};
 use crate::error::sqlx_to_mcp_error;
 
 /// Maximum number of rows returned in a single `execute_sql` response.
@@ -25,6 +28,9 @@ const MAX_RESOURCE_ROWS: usize = 100;
 
 /// Implementation name advertised to clients during initialization.
 const SERVER_NAME: &str = "rdb-mcp";
+
+/// MIME type of table-data resources, which carry a JSON-serialized [`QueryResult`].
+const RESOURCE_MIME_TYPE: &str = "application/json";
 
 /// Core handler implementing [`ServerHandler`] from `rmcp`, dispatching MCP tool calls
 /// to the underlying [`DatabaseConnection`].
@@ -50,6 +56,26 @@ pub struct DescribeTableParams {
     pub table_name: String,
 }
 
+/// Output of the `execute_sql` tool.
+///
+/// Read queries and write/DDL statements produce different shapes, discriminated
+/// by the `kind` field so that a single output schema covers both.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecuteSqlResult {
+    /// The statement was a read query and returned a result set.
+    Query(QueryResult),
+    /// The statement was a write or DDL statement and reported affected rows.
+    Execution(ExecutionResult),
+}
+
+/// Output of the `list_tables` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListTablesResult {
+    /// Names of the tables in the database's default user-facing schema.
+    pub tables: Vec<String>,
+}
+
 impl McpServer {
     async fn fetch_table_names(&self) -> Result<Vec<String>, McpError> {
         let sql = self.db.db_type().list_tables_query();
@@ -66,13 +92,13 @@ impl McpServer {
 
     #[tool(
         name = "execute_sql",
-        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return results as CSV. Write and DDL queries return the number of affected rows.",
+        description = "Execute an arbitrary SQL query. Read queries (SELECT, SHOW, EXPLAIN, PRAGMA, DESCRIBE, and WITH/CTE selects) return JSON with `kind: \"query\"`, the column names, and the rows, where a null value means SQL NULL. Write and DDL statements return JSON with `kind: \"execution\"` and the number of affected rows.",
         annotations(destructive_hint = true)
     )]
     async fn execute_sql(
         &self,
         params: Parameters<ExecuteSqlParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<ExecuteSqlResult>, McpError> {
         let raw_query = params.0.query;
         let query = raw_query.trim();
 
@@ -87,76 +113,55 @@ impl McpServer {
         tracing::debug!(query = %query, "executing SQL");
 
         if db::is_read_query(query) {
-            let (csv, truncated) =
-                self.db.fetch_streaming_as_csv(query, MAX_RESULT_ROWS).await.map_err(|e| {
-                    tracing::error!(query = %query, error = %e, "read query failed");
-                    sqlx_to_mcp_error(e)
-                })?;
-
-            if csv.is_empty() {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "Query returned 0 rows.",
-                )]));
-            }
-
-            let mut result_csv = csv;
-            if truncated {
-                result_csv.push_str(&format!(
-                    "\n\n(Note: Results truncated. Showing first {MAX_RESULT_ROWS} rows.)"
-                ));
-            }
-            Ok(CallToolResult::success(vec![ContentBlock::text(result_csv)]))
+            let result = self.db.fetch_streaming(query, MAX_RESULT_ROWS).await.map_err(|e| {
+                tracing::error!(query = %query, error = %e, "read query failed");
+                sqlx_to_mcp_error(e)
+            })?;
+            Ok(Json(ExecuteSqlResult::Query(result)))
         } else {
-            let rows_affected = self.db.execute_sql(query).await.map_err(|e| {
+            let result = self.db.execute_sql(query).await.map_err(|e| {
                 tracing::error!(query = %query, error = %e, "write query failed");
                 sqlx_to_mcp_error(e)
             })?;
-            let text = format!("Rows affected: {rows_affected}");
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            Ok(Json(ExecuteSqlResult::Execution(result)))
         }
     }
 
     #[tool(
         name = "list_tables",
-        description = "List all tables in the database.",
+        description = "List all tables in the database. Returns JSON with the table names.",
         annotations(read_only_hint = true)
     )]
-    async fn list_tables(&self) -> Result<CallToolResult, McpError> {
+    async fn list_tables(&self) -> Result<Json<ListTablesResult>, McpError> {
         let tables = self.fetch_table_names().await?;
-        if tables.is_empty() {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "No tables found in the database.",
-            )]));
-        }
-        let text = tables.join("\n");
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        Ok(Json(ListTablesResult { tables }))
     }
 
     #[tool(
         name = "describe_table",
-        description = "Describe the schema of a specific table, returning column names, data types, nullability, and defaults. Constraint details vary by database engine.",
+        description = "Describe the schema of a specific table. Returns JSON with the column names and one row per table column, describing its data type, nullability, and default. Constraint details vary by database engine.",
         annotations(read_only_hint = true)
     )]
     async fn describe_table(
         &self,
         params: Parameters<DescribeTableParams>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<Json<QueryResult>, McpError> {
         let table_name =
             ValidatedTableName::new(&params.0.table_name).map_err(|e| e.into_mcp_error())?;
 
-        let csv = self.db.describe_table_as_csv(&table_name).await.map_err(|e| {
+        let result = self.db.describe_table(&table_name).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "describe table failed");
             e.into_mcp_error()
         })?;
 
-        if csv.is_empty() {
+        if result.is_empty() {
             return Err(McpError::resource_not_found(
-                format!("table '{}' not found or has no columns", table_name),
+                format!("table '{table_name}' not found or has no columns"),
                 None,
             ));
         }
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(csv)]))
+        Ok(Json(result))
     }
 }
 
@@ -166,7 +171,9 @@ impl McpServer {
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            // `ProtocolVersion::LATEST` is still 2025-11-25, so 2026-07-28 must be named
+            // explicitly. rmcp negotiates down for clients that ask for an older version.
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             // `Implementation::from_build_env()` resolves `env!` at rmcp's own compile time,
             // so it would advertise the SDK's crate name and version instead of this server's.
             .with_server_info(Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION")))
@@ -195,7 +202,7 @@ impl ServerHandler for McpServer {
                 Some(
                     Resource::new(uri, format!("Table: {table_name}"))
                         .with_description(format!("Data in table {table_name}"))
-                        .with_mime_type("text/csv"),
+                        .with_mime_type(RESOURCE_MIME_TYPE),
                 )
             })
             .collect();
@@ -248,16 +255,19 @@ impl ServerHandler for McpServer {
 
         let quoted = self.db.db_type().quote_identifier(&table_name);
         let sql = format!("SELECT * FROM {quoted} LIMIT {MAX_RESOURCE_ROWS}");
-        let csv = self.db.fetch_all_as_csv(&sql).await.map_err(|e| {
+        let result = self.db.fetch_all(&sql).await.map_err(|e| {
             tracing::error!(table = %table_name, error = %e, "read resource failed");
             sqlx_to_mcp_error(e)
         })?;
-        let content = if csv.is_empty() {
-            format!("Table '{}' exists but contains no rows.", table_name)
-        } else {
-            csv
-        };
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(content, uri.clone())]).into())
+        let content = serde_json::to_string(&result).map_err(|e| {
+            tracing::error!(table = %table_name, error = %e, "failed to serialize resource");
+            McpError::internal_error(format!("failed to serialize resource: {e}"), None)
+        })?;
+        // `ResourceContents::text` defaults to text/plain; override it so the read
+        // agrees with the MIME type advertised by `list_resources`.
+        let contents =
+            ResourceContents::text(content, uri.clone()).with_mime_type(RESOURCE_MIME_TYPE);
+        Ok(ReadResourceResult::new(vec![contents]).into())
     }
 }
 
