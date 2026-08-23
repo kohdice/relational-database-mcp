@@ -15,20 +15,27 @@ use thiserror::Error;
 /// - `Database` → delegated to [`sqlx_to_mcp_error`]
 #[derive(Debug, Error)]
 pub enum AppError {
+    /// The connection URL uses a scheme that maps to no supported engine.
+    /// Holds the offending scheme only, never the full URL.
     #[error("unsupported database URL scheme: {0}")]
     UnsupportedScheme(String),
 
+    /// A table name failed [`ValidatedTableName`](crate::db::ValidatedTableName) validation.
     #[error("{0}")]
     InvalidTableName(String),
 
+    /// Establishing the connection pool failed. The message is sanitized to
+    /// avoid leaking credentials embedded in the connection URL.
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
+    /// A query or statement failed at the driver level.
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
 
 impl AppError {
+    /// Converts this error into an MCP protocol error with the appropriate error code.
     pub fn into_mcp_error(self) -> McpError {
         let msg = self.to_string();
         match self {

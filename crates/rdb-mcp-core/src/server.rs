@@ -31,14 +31,18 @@ pub struct McpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Input parameters of the `execute_sql` tool.
 #[derive(Deserialize, JsonSchema)]
 pub struct ExecuteSqlParams {
+    /// SQL query to execute.
     #[schemars(description = "SQL query to execute")]
     pub query: String,
 }
 
+/// Input parameters of the `describe_table` tool.
 #[derive(Deserialize, JsonSchema)]
 pub struct DescribeTableParams {
+    /// Name of the table to describe.
     #[schemars(description = "Name of the table to describe")]
     pub table_name: String,
 }

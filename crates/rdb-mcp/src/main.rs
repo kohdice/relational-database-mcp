@@ -1,17 +1,19 @@
-//! MCP (Model Context Protocol) server for relational databases.
+//! MCP (Model Context Protocol) server for relational databases over stdio.
+//!
 //! Supports MySQL, PostgreSQL, and SQLite.
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rdb_mcp_core::{db::DatabaseConnection, server::McpServer};
 use rmcp::{ServiceExt, transport::stdio};
 
-pub mod cli;
-pub mod db;
-pub mod error;
-pub mod server;
+mod cli;
 
 /// Parses CLI arguments, connects to the database, and runs the MCP server on stdio.
-pub async fn run() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    // stdout is reserved for the MCP JSON-RPC stream, so logs must go to stderr.
+    // ANSI escape codes are disabled because the sink is not assumed to be a terminal.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -20,12 +22,12 @@ pub async fn run() -> Result<()> {
 
     let args = cli::Args::parse();
 
-    let db = db::DatabaseConnection::connect(&args.database_url)
+    let db = DatabaseConnection::connect(&args.database_url)
         .await
         .context("failed to connect to database")?;
     tracing::info!(db_type = %db.db_type(), "connected to database");
 
-    let server = server::McpServer::new(db);
+    let server = McpServer::new(db);
     let service = server.serve(stdio()).await.context("failed to start MCP server")?;
 
     tracing::info!("MCP server started on stdio");

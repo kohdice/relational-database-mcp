@@ -1,6 +1,11 @@
-use relational_database_mcp::db::{self, DatabaseConnection, DbType};
+//! End-to-end tests of the database layer against an in-memory SQLite database.
+
+use rdb_mcp_core::db::{self, DatabaseConnection, DbType};
 use sqlx::pool::PoolOptions;
 
+// clippy's `allow-unwrap-in-tests` only covers `#[test]`-annotated items, so a shared
+// fixture helper in an integration test file needs the exemption spelled out.
+#[expect(clippy::unwrap_used, reason = "test fixture: a failed setup should abort the test")]
 async fn setup_db() -> DatabaseConnection {
     // max_connections(1): SQLite :memory: creates a separate DB per connection.
     // Restricting to 1 connection ensures all operations share the same DB.

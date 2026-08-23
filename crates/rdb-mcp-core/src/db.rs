@@ -49,8 +49,11 @@ const MAX_TABLE_NAME_LEN: usize = 128;
 /// identifier quoting, and resource URI schemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DbType {
+    /// MySQL (and protocol-compatible engines such as MariaDB).
     Mysql,
+    /// PostgreSQL.
     Postgres,
+    /// SQLite.
     Sqlite,
 }
 
