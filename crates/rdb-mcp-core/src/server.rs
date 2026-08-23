@@ -309,4 +309,157 @@ mod tests {
         assert!(parse_table_from_uri("mysql://users/other").is_err());
         assert!(parse_table_from_uri("invalid").is_err());
     }
+
+    /// Builds a server over an in-memory SQLite database holding a single `users` table.
+    ///
+    /// max_connections(1): SQLite :memory: creates a separate DB per connection,
+    /// so a single connection keeps every operation on the same database.
+    async fn setup_server() -> McpServer {
+        let pool = sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let db = DatabaseConnection::from_sqlite_pool(pool);
+        db.execute_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+            .await
+            .unwrap();
+        db.execute_sql("INSERT INTO users VALUES (1, 'Alice', NULL)").await.unwrap();
+        McpServer::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_get_info_advertises_latest_protocol_and_own_identity() {
+        let server = setup_server().await;
+        let info = server.get_info();
+
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+        assert_eq!(info.server_info.name, SERVER_NAME);
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.capabilities.tools.is_some(), "tools capability must be advertised");
+        assert!(info.capabilities.resources.is_some(), "resources capability must be advertised");
+        assert!(info.instructions.is_some());
+    }
+
+    #[test]
+    fn test_tool_router_registers_every_tool_with_an_output_schema() {
+        let tools = McpServer::tool_router().list_all();
+
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["describe_table", "execute_sql", "list_tables"]);
+
+        for tool in &tools {
+            assert!(
+                tool.output_schema.is_some(),
+                "tool '{}' must declare an output schema so it can return structuredContent",
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_read_returns_query_result() {
+        let server = setup_server().await;
+
+        let Json(result) = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                query: "SELECT id, name, email FROM users".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let ExecuteSqlResult::Query(query) = result else {
+            panic!("a SELECT must be classified as a read query");
+        };
+        assert_eq!(query.columns, vec!["id", "name", "email"]);
+        assert_eq!(query.row_count, 1);
+        assert!(!query.truncated);
+        assert_eq!(query.rows[0][1].as_deref(), Some("Alice"));
+        assert_eq!(query.rows[0][2], None, "SQL NULL must decode to None");
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_write_returns_execution_result() {
+        let server = setup_server().await;
+
+        let Json(result) = server
+            .execute_sql(Parameters(ExecuteSqlParams {
+                query: "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let ExecuteSqlResult::Execution(execution) = result else {
+            panic!("an INSERT must be classified as a write statement");
+        };
+        assert_eq!(execution.rows_affected, 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_rejects_empty_query() {
+        let server = setup_server().await;
+
+        let Err(error) =
+            server.execute_sql(Parameters(ExecuteSqlParams { query: "   ".to_string() })).await
+        else {
+            panic!("a blank query must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_list_tables_returns_table_names() {
+        let server = setup_server().await;
+
+        let Json(result) = server.list_tables().await.unwrap();
+
+        assert_eq!(result.tables, vec!["users"]);
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_returns_column_metadata() {
+        let server = setup_server().await;
+
+        let Json(result) = server
+            .describe_table(Parameters(DescribeTableParams { table_name: "users".to_string() }))
+            .await
+            .unwrap();
+
+        assert!(!result.is_empty());
+        assert!(result.columns.iter().any(|c| c == "name"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_rejects_invalid_name() {
+        let server = setup_server().await;
+
+        let Err(error) = server
+            .describe_table(Parameters(DescribeTableParams {
+                table_name: "users; DROP TABLE users".to_string(),
+            }))
+            .await
+        else {
+            panic!("a table name with invalid characters must be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_reports_unknown_table_as_not_found() {
+        let server = setup_server().await;
+
+        let Err(error) = server
+            .describe_table(Parameters(DescribeTableParams {
+                table_name: "nonexistent".to_string(),
+            }))
+            .await
+        else {
+            panic!("describing an unknown table must fail");
+        };
+
+        assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+    }
 }
