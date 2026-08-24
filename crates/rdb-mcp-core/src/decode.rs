@@ -95,6 +95,11 @@ impl CellDecode for sqlx::mysql::MySqlRow {
             "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" => {
                 render!(self, index, String)
             }
+            // A SET is length-prefixed text on the wire, exactly like ENUM, but
+            // `<str as Type<MySql>>::compatible` lists `ColumnType::Enum` and not
+            // `ColumnType::Set`, so the checked path rejects it. Read it unchecked
+            // rather than failing every `SELECT *` over a table holding one.
+            "SET" => self.try_get_unchecked::<String, _>(index)?,
             "DATETIME" => render!(self, index, chrono::NaiveDateTime),
             "TIMESTAMP" => render!(self, index, chrono::DateTime<chrono::Utc>),
             "DATE" => render!(self, index, chrono::NaiveDate),
