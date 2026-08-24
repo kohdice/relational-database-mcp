@@ -167,23 +167,38 @@ list_tables()
 
 ### `describe_table`
 
-Describe the schema of a specific table, returning one row per column with its data type, nullability, and default. Constraint details vary by database engine.
+Describe the schema of a specific table, returning one row per column.
 
 | Parameter    | Type   | Required | Description                   |
 | ------------ | ------ | -------- | ----------------------------- |
 | `table_name` | string | Yes      | Name of the table to describe |
 
+Every engine reports the same five result columns, in this order:
+
+| Column           | Description                                                           |
+| ---------------- | --------------------------------------------------------------------- |
+| `name`           | Column name.                                                          |
+| `data_type`      | The column's type, in the engine's own spelling (see the note below). |
+| `is_nullable`    | `YES` or `NO`.                                                        |
+| `column_default` | The default expression, or `null` when the column has no default.     |
+| `primary_key`    | `YES` or `NO`.                                                        |
+
 ```jsonc
+// PostgreSQL, for `users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email VARCHAR(255))`
 describe_table({ "table_name": "users" })
 → {
-    "columns": ["cid", "name", "type", "notnull", "dflt_value", "pk"],
-    "rows": [["0", "id", "INTEGER", "0", null, "1"], ["1", "name", "TEXT", "0", null, "0"]],
-    "row_count": 2,
+    "columns": ["name", "data_type", "is_nullable", "column_default", "primary_key"],
+    "rows": [
+      ["id", "integer", "NO", null, "YES"],
+      ["name", "text", "NO", null, "NO"],
+      ["email", "character varying", "YES", null, "NO"]
+    ],
+    "row_count": 3,
     "truncated": false
   }
 ```
 
-The column names above are SQLite's; MySQL and PostgreSQL report their own `information_schema` columns.
+`data_type` is deliberately **not** normalized across engines: the same declaration is reported as `int` by MySQL, `integer` by PostgreSQL, and `INTEGER` by SQLite. Only the result shape is uniform.
 
 Table names are validated to contain only alphanumeric characters and underscores.
 

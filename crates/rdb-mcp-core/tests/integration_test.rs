@@ -112,11 +112,22 @@ async fn test_describe_table_sqlite() {
     let table = db::ValidatedTableName::new("users").unwrap();
     let result = db.describe_table(&table).await.unwrap();
 
-    // PRAGMA table_info returns one row per column, with the column name in `name`.
-    let name_index = result.columns.iter().position(|c| c == "name").unwrap();
-    let described: Vec<Option<&str>> =
-        result.rows.iter().map(|row| row[name_index].as_deref()).collect();
+    assert_eq!(
+        result.columns,
+        vec!["name", "data_type", "is_nullable", "column_default", "primary_key"]
+    );
+    let described: Vec<Option<&str>> = result.rows.iter().map(|row| row[0].as_deref()).collect();
     assert_eq!(described, vec![Some("id"), Some("name"), Some("email")]);
+    // SQLite reports the declared type verbatim; it is not normalized across engines.
+    let types: Vec<Option<&str>> = result.rows.iter().map(|row| row[1].as_deref()).collect();
+    assert_eq!(types, vec![Some("INTEGER"), Some("TEXT"), Some("TEXT")]);
+    // `id INTEGER PRIMARY KEY` is a rowid alias, and SQLite leaves such a column
+    // nullable unless NOT NULL is declared, so YES here is the engine's own truth.
+    let nullable: Vec<Option<&str>> = result.rows.iter().map(|row| row[2].as_deref()).collect();
+    assert_eq!(nullable, vec![Some("YES"), Some("NO"), Some("YES")]);
+    assert_eq!(cell(&result.rows, 0, 3), None);
+    let primary_key: Vec<Option<&str>> = result.rows.iter().map(|row| row[4].as_deref()).collect();
+    assert_eq!(primary_key, vec![Some("YES"), Some("NO"), Some("NO")]);
 }
 
 #[tokio::test]
@@ -302,5 +313,5 @@ async fn test_describe_table_dispatch_sqlite() {
 
     assert!(!result.is_empty());
     assert!(result.columns.iter().any(|c| c == "name"));
-    assert!(result.columns.iter().any(|c| c == "type"));
+    assert!(result.columns.iter().any(|c| c == "data_type"));
 }

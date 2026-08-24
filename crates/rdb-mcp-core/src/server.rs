@@ -170,7 +170,7 @@ impl McpServer {
 
     #[tool(
         name = "describe_table",
-        description = "Describe the schema of a specific table. Returns JSON with the column names and one row per table column, describing its data type, nullability, and default. Constraint details vary by database engine.",
+        description = "Describe the schema of a specific table. Returns JSON with one row per table column and always the same five result columns, in this order: `name` (the column name), `data_type`, `is_nullable` (`YES` or `NO`), `column_default` (null when the column has no default), and `primary_key` (`YES` or `NO`). The shape is identical on every engine, but `data_type` is the engine's own type name and is not normalized (MySQL `int`, PostgreSQL `integer`, SQLite `INTEGER`).",
         annotations(read_only_hint = true)
     )]
     async fn describe_table(

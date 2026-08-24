@@ -132,26 +132,79 @@ impl DbType {
 
     /// Returns a [`DescribeQuery`] for retrieving column metadata of the given table.
     ///
-    /// MySQL and PostgreSQL use parameterized `information_schema` queries.
-    /// SQLite uses `PRAGMA table_info` with the table name interpolated (safe because
-    /// [`ValidatedTableName`] guarantees only `[a-zA-Z0-9_]` characters).
+    /// Every engine projects the same five columns, in this order, so that the
+    /// `describe_table` tool's result shape does not depend on which engine answers it:
+    ///
+    /// | Column           | Value                                                   |
+    /// | ---------------- | ------------------------------------------------------- |
+    /// | `name`           | Column name.                                            |
+    /// | `data_type`      | The engine's own type name, deliberately not normalized. |
+    /// | `is_nullable`    | `YES` or `NO`.                                          |
+    /// | `column_default` | Default expression, or SQL NULL when there is none.     |
+    /// | `primary_key`    | `YES` or `NO`.                                          |
+    ///
+    /// `data_type` stays engine-specific (MySQL `int`, PostgreSQL `integer`, SQLite
+    /// `INTEGER` all describe the same declaration) because a cross-engine type
+    /// taxonomy is a separate design decision. `YES`/`NO` is `information_schema`'s own
+    /// spelling for `is_nullable`, so MySQL and PostgreSQL need no translation, and
+    /// every value in this API is a string regardless.
+    ///
+    /// MySQL and PostgreSQL use parameterized `information_schema` queries, each binding
+    /// the table name exactly once. SQLite interpolates the table name instead, which is
+    /// safe because [`ValidatedTableName`] guarantees only `[a-zA-Z0-9_]` characters.
     pub(crate) fn describe_table_query(&self, table: &ValidatedTableName) -> DescribeQuery {
         match self {
             Self::Mysql => DescribeQuery::Parameterized(
-                "SELECT column_name, data_type, is_nullable, column_default, column_key \
+                // Aliases are what force the labels to lower case: MySQL labels an
+                // unaliased information_schema column with the catalog's own upper-case
+                // spelling. `column_key` is 'PRI' exactly for primary-key columns, so no
+                // join is needed.
+                "SELECT column_name AS name, \
+                 data_type AS data_type, \
+                 is_nullable AS is_nullable, \
+                 column_default AS column_default, \
+                 CASE WHEN column_key = 'PRI' THEN 'YES' ELSE 'NO' END AS primary_key \
                  FROM information_schema.columns \
                  WHERE table_schema = DATABASE() AND table_name = ? \
                  ORDER BY ordinal_position",
             ),
             Self::Postgres => DescribeQuery::Parameterized(
-                "SELECT column_name, data_type, is_nullable, column_default \
-                 FROM information_schema.columns \
-                 WHERE table_schema = 'public' AND table_name = $1 \
-                 ORDER BY ordinal_position",
+                // PostgreSQL has no equivalent of MySQL's `column_key`, so primary-key
+                // membership comes from a join of the two constraint views. Restricting
+                // that join to PRIMARY KEY constraints before the LEFT JOIN keeps it at
+                // one row per column; joining `key_column_usage` directly would also
+                // match unique and foreign keys and duplicate rows.
+                "SELECT c.column_name AS name, \
+                 c.data_type AS data_type, \
+                 c.is_nullable AS is_nullable, \
+                 c.column_default AS column_default, \
+                 CASE WHEN pk.column_name IS NULL THEN 'NO' ELSE 'YES' END AS primary_key \
+                 FROM information_schema.columns c \
+                 LEFT JOIN ( \
+                 SELECT kcu.table_name, kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                 ON kcu.constraint_schema = tc.constraint_schema \
+                 AND kcu.constraint_name = tc.constraint_name \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public' \
+                 ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name \
+                 WHERE c.table_schema = 'public' AND c.table_name = $1 \
+                 ORDER BY c.ordinal_position",
             ),
             Self::Sqlite => {
                 let name = table.as_str();
-                DescribeQuery::Interpolated(format!("PRAGMA table_info('{name}')"))
+                // The table-valued `pragma_table_info` form is used instead of
+                // `PRAGMA table_info`, because a bare PRAGMA statement cannot be
+                // aliased or wrapped in CASE expressions. `notnull` is a SQLite
+                // keyword, so it has to be quoted to be read as a column name.
+                DescribeQuery::Interpolated(format!(
+                    "SELECT name AS name, \
+                     type AS data_type, \
+                     CASE \"notnull\" WHEN 0 THEN 'YES' ELSE 'NO' END AS is_nullable, \
+                     dflt_value AS column_default, \
+                     CASE pk WHEN 0 THEN 'NO' ELSE 'YES' END AS primary_key \
+                     FROM pragma_table_info('{name}')"
+                ))
             }
         }
     }
@@ -562,14 +615,22 @@ mod tests {
         assert!(q.contains("sqlite_master"));
     }
 
+    /// Asserts that a describe query aliases its projection to the five labels
+    /// every engine must report, in order.
+    fn assert_describes_uniform_columns(sql: &str) {
+        for label in ["name", "data_type", "is_nullable", "column_default", "primary_key"] {
+            assert!(sql.contains(&format!("AS {label}")), "{sql} must alias {label}");
+        }
+    }
+
     #[test]
     fn test_describe_table_query_sqlite_interpolated() {
         let table = ValidatedTableName::new("users").unwrap();
         let query = DbType::Sqlite.describe_table_query(&table);
         match query {
             DescribeQuery::Interpolated(sql) => {
-                assert!(sql.contains("PRAGMA"));
-                assert!(sql.contains("users"));
+                assert!(sql.contains("pragma_table_info('users')"));
+                assert_describes_uniform_columns(&sql);
             }
             DescribeQuery::Parameterized(_) => panic!("expected Interpolated for SQLite"),
         }
@@ -582,7 +643,10 @@ mod tests {
         match query {
             DescribeQuery::Parameterized(sql) => {
                 assert!(sql.contains("information_schema"));
-                assert!(sql.contains('?'));
+                // `describe_table` binds exactly one value, so a second placeholder
+                // would leave the statement short of an argument.
+                assert_eq!(sql.matches('?').count(), 1);
+                assert_describes_uniform_columns(sql);
             }
             DescribeQuery::Interpolated(_) => panic!("expected Parameterized for MySQL"),
         }
@@ -596,6 +660,7 @@ mod tests {
             DescribeQuery::Parameterized(sql) => {
                 assert!(sql.contains("information_schema"));
                 assert!(sql.contains("$1"));
+                assert_describes_uniform_columns(sql);
             }
             DescribeQuery::Interpolated(_) => panic!("expected Parameterized for PostgreSQL"),
         }
