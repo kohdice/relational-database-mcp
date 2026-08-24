@@ -99,7 +99,8 @@ impl DbType {
     ///
     /// # Errors
     /// Returns [`AppError::UnsupportedScheme`] when the URL's scheme maps to no
-    /// supported engine. The error carries only the scheme, never the full URL.
+    /// supported engine. The error carries only the scheme, never the full URL;
+    /// an input with no `:` has no scheme at all and is reported as `unknown`.
     pub fn from_url(url: &str) -> Result<Self, AppError> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -108,7 +109,7 @@ impl DbType {
         } else if url.starts_with("sqlite://") || url.starts_with("sqlite:") {
             Ok(Self::Sqlite)
         } else {
-            let scheme = url.split(':').next().unwrap_or("unknown");
+            let scheme = url.split_once(':').map_or("unknown", |(scheme, _)| scheme);
             Err(AppError::UnsupportedScheme(scheme.to_string()))
         }
     }
@@ -466,6 +467,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("oracle"), "error should contain scheme");
         assert!(!msg.contains("secret"), "error must not contain credentials");
+    }
+
+    #[test]
+    fn test_db_type_from_url_without_scheme_reports_unknown() {
+        // An input with no `:` has no scheme to report, so echoing it back would
+        // put the caller's whole string — possibly a bare password — in the error.
+        let err = DbType::from_url("s3cr3t-not-a-url").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("s3cr3t-not-a-url"), "error must not echo the input");
+        assert!(msg.contains("unknown"), "error should report an unknown scheme");
     }
 
     #[test]
