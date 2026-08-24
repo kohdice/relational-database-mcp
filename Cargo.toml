@@ -30,6 +30,10 @@ sqlx = { version = "0.9.0", features = [
     "postgres",
     "sqlite",
 ] }
+testcontainers-modules = { version = "0.15.0", features = [
+    "mysql",
+    "postgres",
+] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"

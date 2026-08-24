@@ -214,6 +214,45 @@ Each table in the database is exposed as an MCP resource.
 
 For example, a `users` table in a MySQL database is available at `mysql://users/data`.
 
+## Development
+
+Common tasks are [`just`](https://github.com/casey/just) recipes:
+
+```bash
+just fmt        # Format the source
+just lint       # Clippy with warnings denied
+just test       # Run the test suite
+just check-ci   # Format check + lint, in CI order
+```
+
+### Testing
+
+`just test` runs every test that needs no external service: the unit tests and the
+SQLite-backed integration tests. It needs nothing installed beyond the Rust toolchain.
+
+Decoding differs enough between drivers that SQLite cannot stand in for the others --
+PostgreSQL matches column types by OID, and MySQL reports unsigned integers as a
+distinct type. Those paths are covered by tests that start a real database in a
+container:
+
+```bash
+just test-db    # Everything above, plus the MySQL and PostgreSQL tests
+```
+
+Each such test starts its database with
+[testcontainers](https://rust.testcontainers.org/) and removes it when the test ends,
+so no fixture outlives the run and nothing needs to be started by hand. They are
+marked `#[ignore]` so that `just test` stays fast and runtime-free; `just test-db`
+runs them with `--include-ignored`.
+
+This needs a container runtime -- Docker or Podman. Podman does not export
+`DOCKER_HOST`, so `just test-db` points it at the machine's Docker-compatible socket
+when the variable is unset. Start the machine first:
+
+```bash
+podman machine start
+```
+
 ## License
 
 MIT
