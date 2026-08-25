@@ -32,6 +32,8 @@ static CONTAINER_SLOTS: Semaphore = Semaphore::const_new(2);
 /// bounds how many containers exist at once is handed to the next waiting test.
 struct MysqlFixture {
     db: DatabaseConnection,
+    host: String,
+    port: u16,
     _container: ContainerAsync<Mysql>,
     _slot: SemaphorePermit<'static>,
 }
@@ -40,17 +42,28 @@ struct MysqlFixture {
 // fixture helper in an integration test file needs the exemption spelled out.
 #[expect(clippy::unwrap_used, reason = "test fixture: a failed setup should abort the test")]
 async fn start_mysql() -> MysqlFixture {
+    // `DatabaseConnection::connect` reports the sqlx cause only through `tracing::error!`,
+    // masking it in the returned error to keep URL credentials out of client-facing
+    // messages. Without a subscriber that cause is dropped, so a connection failure here
+    // would be indistinguishable from any other. `try_init` tolerates the repeat calls the
+    // other tests in this file make.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
     let slot = CONTAINER_SLOTS.acquire().await.unwrap();
     let container = Mysql::default().with_tag(IMAGE_TAG).start().await.unwrap();
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
 
     // The module boots the server with an empty root password and a `test` database.
-    let url = format!(
-        "mysql://root@{}:{}/test",
-        container.get_host().await.unwrap(),
-        container.get_host_port_ipv4(3306).await.unwrap()
-    );
+    let url = format!("mysql://root@{host}:{port}/test");
 
-    MysqlFixture { db: connect_with_retry(&url).await, _container: container, _slot: slot }
+    MysqlFixture {
+        db: connect_with_retry(&url).await,
+        host,
+        port,
+        _container: container,
+        _slot: slot,
+    }
 }
 
 /// Number of connection attempts before a failure is reported as a test failure.
@@ -463,4 +476,71 @@ async fn fetch_streaming_truncates_at_max_rows() {
     let complete = db.fetch_streaming("SELECT id FROM numbers ORDER BY id", 3).await.unwrap();
     assert!(!complete.truncated);
     assert_eq!(complete.row_count, 3);
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn caching_sha2_password_user_connects_without_tls() {
+    let fixture = start_mysql().await;
+    let db = &fixture.db;
+
+    // The fixture's own root account has an empty password, which skips the exchange
+    // under test; a freshly created account always misses the server-side auth cache,
+    // so connecting as it forces `caching_sha2_password` full authentication.
+    db.execute_sql(
+        "CREATE USER 'pw_user'@'%' IDENTIFIED WITH caching_sha2_password BY 'pw_secret'",
+    )
+    .await
+    .unwrap();
+    db.execute_sql("GRANT ALL PRIVILEGES ON test.* TO 'pw_user'@'%'").await.unwrap();
+
+    // `ssl-mode=disabled` pins the non-TLS route: under sqlx's default `PREFERRED` the
+    // connection would upgrade to TLS and authenticate over the encrypted channel
+    // instead, leaving the RSA password-encryption path untested.
+    let url = format!(
+        "mysql://pw_user:pw_secret@{}:{}/test?ssl-mode=disabled",
+        fixture.host, fixture.port
+    );
+
+    let pw_db = DatabaseConnection::connect(&url).await.unwrap();
+    let result = pw_db.fetch_streaming("SELECT 1", 1).await.unwrap();
+
+    assert_eq!(cell(&result.rows, 0, 0), Some("1"));
+
+    // `Ssl_cipher` is empty exactly when the session is unencrypted, which is this test's
+    // premise rather than its subject: sqlx silently ignores query keys it does not know,
+    // so a renamed or mistyped `ssl-mode` would fall back to `PREFERRED`, authenticate over
+    // TLS, and leave the RSA path `mysql-rsa` guards untouched while still passing above.
+    let session = session_ssl_cipher(&pw_db).await;
+    assert_eq!(session.as_deref(), Some(""));
+}
+
+/// Returns the session's `Ssl_cipher` status value: the negotiated cipher suite over TLS,
+/// and the empty string on a plaintext connection.
+#[expect(clippy::unwrap_used, reason = "test helper: a failed query should abort the test")]
+async fn session_ssl_cipher(db: &DatabaseConnection) -> Option<String> {
+    let status = db.fetch_streaming("SHOW SESSION STATUS LIKE 'Ssl_cipher'", 1).await.unwrap();
+    // `SHOW STATUS` returns one `Variable_name`, `Value` pair per matched variable.
+    status.rows[0][1].clone()
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn ssl_mode_required_connects_over_tls() {
+    let fixture = start_mysql().await;
+
+    // `required` demands an encrypted channel but verifies no certificate, which is what
+    // makes it usable here: the image generates a self-signed certificate at startup,
+    // and only `verify_ca` / `verify_identity` would reject it.
+    let url = format!("mysql://root@{}:{}/test?ssl-mode=required", fixture.host, fixture.port);
+
+    let tls_db = DatabaseConnection::connect(&url).await.unwrap();
+    let result = tls_db.fetch_streaming("SELECT 1", 1).await.unwrap();
+
+    assert_eq!(cell(&result.rows, 0, 0), Some("1"));
+
+    // The mirror of the non-TLS test's premise check: a named cipher suite is what
+    // distinguishes an encrypted session from a silent fallback to plaintext.
+    let cipher = session_ssl_cipher(&tls_db).await;
+    assert!(cipher.is_some_and(|name| !name.is_empty()), "expected a negotiated TLS cipher");
 }
