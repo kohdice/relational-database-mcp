@@ -257,9 +257,77 @@ async fn float_double_and_decimal_columns_keep_their_written_form() {
 
     assert_eq!(column(&result.rows, 0), vec![Some("3.5"), Some("-1.25")]);
     assert_eq!(column(&result.rows, 1), vec![Some("0.1"), Some("2.5")]);
-    // DECIMAL(10,2) is exact, and the decoded Decimal carries the column's scale, so
+    // DECIMAL(10,2) is exact, and the decoded value carries the column's scale, so
     // the trailing zero MySQL stored survives into the string.
     assert_eq!(column(&result.rows, 2), vec![Some("1234.50"), Some("-0.05")]);
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn decimal_columns_decode_without_precision_loss() {
+    let fixture = start_mysql().await;
+    let db = &fixture.db;
+
+    db.execute_sql(
+        "CREATE TABLE precise_amounts (
+            id INT PRIMARY KEY,
+            amount DECIMAL(65,30) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO precise_amounts (id, amount) VALUES
+            (1, 12345678901234567890123456789012345.123456789012345678901234567890)",
+    )
+    .await
+    .unwrap();
+
+    let result =
+        db.fetch_streaming("SELECT amount FROM precise_amounts ORDER BY id", 100).await.unwrap();
+
+    // MySQL DECIMAL holds up to 65 significant digits, far more than the 96-bit
+    // mantissa of a fixed-width decimal, whose parser rounds the excess away without
+    // reporting an error — the value comes back altered rather than failing.
+    assert_eq!(
+        cell(&result.rows, 0, 0),
+        Some("12345678901234567890123456789012345.123456789012345678901234567890")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn decimal_columns_spell_out_every_digit_of_their_scale() {
+    let fixture = start_mysql().await;
+    let db = &fixture.db;
+
+    db.execute_sql(
+        "CREATE TABLE scaled_amounts (
+            id INT PRIMARY KEY,
+            tiny DECIMAL(20,10) NOT NULL,
+            amount DECIMAL(10,2) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO scaled_amounts (id, tiny, amount) VALUES
+            (1, 0.0000001, 0.00),
+            (2, 0.0000000001, 1234.56)",
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .fetch_streaming("SELECT tiny, amount FROM scaled_amounts ORDER BY id", 100)
+        .await
+        .unwrap();
+
+    // MySQL pads a DECIMAL to its declared scale, so these are the digits the server
+    // holds; a value below 1e-6 must still be spelled out rather than exponentiated.
+    assert_eq!(column(&result.rows, 0), vec![Some("0.0000001000"), Some("0.0000000001")]);
+    // Zero carries the column's scale exactly like every other value stored in it.
+    assert_eq!(column(&result.rows, 1), vec![Some("0.00"), Some("1234.56")]);
 }
 
 #[tokio::test]
@@ -312,7 +380,7 @@ async fn text_enum_set_and_json_columns_decode_as_strings() {
 
 #[tokio::test]
 #[ignore = "requires a container runtime; run with `just test-db`"]
-async fn temporal_columns_decode_in_chrono_display_format() {
+async fn temporal_columns_decode_in_type_specific_display_formats() {
     let fixture = start_mysql().await;
     let db = &fixture.db;
 
@@ -345,6 +413,66 @@ async fn temporal_columns_decode_in_chrono_display_format() {
     // TIMESTAMP is decoded as an instant, so the rendering names the zone. The value
     // matches what was written because the image's session time zone is UTC.
     assert_eq!(cell(&result.rows, 0, 3), Some("2026-08-24 12:34:56 UTC"));
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn time_columns_decode_across_the_full_mysql_range() {
+    let fixture = start_mysql().await;
+    let db = &fixture.db;
+
+    db.execute_sql(
+        "CREATE TABLE durations (
+            id INT PRIMARY KEY,
+            elapsed TIME NOT NULL,
+            precise TIME(6) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO durations (id, elapsed, precise) VALUES
+            (1, '12:34:56', '00:00:05.000001'),
+            (2, '800:00:00', '00:00:00'),
+            (3, '-838:59:59', '00:00:00'),
+            (4, '09:30:00', '00:00:00.500000')",
+    )
+    .await
+    .unwrap();
+
+    // The CAST columns are the server's own text form of the same values, so the
+    // expected strings below are checked against MySQL rather than assumed.
+    let result = db
+        .fetch_streaming(
+            "SELECT elapsed, CAST(elapsed AS CHAR), precise, CAST(precise AS CHAR)
+             FROM durations ORDER BY id",
+            100,
+        )
+        .await
+        .unwrap();
+
+    // MySQL TIME is a signed elapsed time spanning -838:59:59..=838:59:59, not a time of
+    // day, so every value outside 00:00:00..24:00:00 is rejected by a time-of-day decode
+    // target and fails the whole SELECT rather than the single cell.
+    assert_eq!(
+        column(&result.rows, 0),
+        vec![Some("12:34:56"), Some("800:00:00"), Some("-838:59:59"), Some("09:30:00")]
+    );
+    // A TIME(0) column carries no fractional part, so its rendering is MySQL's verbatim:
+    // hours zero-padded to two digits, three digits kept past 99, sign preserved.
+    assert_eq!(column(&result.rows, 0), column(&result.rows, 1));
+
+    // A nonzero fraction is padded to the six digits MySQL prints for a TIME(6).
+    assert_eq!(cell(&result.rows, 0, 2), Some("00:00:05.000001"));
+    assert_eq!(cell(&result.rows, 3, 2), Some("00:00:00.500000"));
+    assert_eq!(cell(&result.rows, 0, 2), cell(&result.rows, 0, 3));
+    assert_eq!(cell(&result.rows, 3, 2), cell(&result.rows, 3, 3));
+
+    // The declared fractional precision is absent from the row metadata, so a stored zero
+    // fraction is indistinguishable from a TIME(0) value and is rendered without one.
+    // This is the single remaining departure from the server's text form.
+    assert_eq!(cell(&result.rows, 1, 2), Some("00:00:00"));
+    assert_eq!(cell(&result.rows, 1, 3), Some("00:00:00.000000"));
 }
 
 #[tokio::test]

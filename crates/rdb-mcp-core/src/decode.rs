@@ -14,11 +14,17 @@
 //! as `true`), and it pays a failed decode — two string allocations inside sqlx —
 //! for every column of every row.
 
+mod pg_numeric;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sqlx::{
     Column, Row, TypeInfo, ValueRef,
-    types::{Decimal, JsonValue, Uuid},
+    mysql::types::MySqlTime,
+    postgres::PgTypeInfo,
+    types::{BigDecimal, JsonValue, Uuid},
 };
+
+use pg_numeric::PgNumeric;
 
 /// Prefix marking a value that was base64-encoded because it is not valid UTF-8.
 pub(crate) const BINARY_PREFIX: &str = "base64:";
@@ -31,6 +37,49 @@ pub(crate) const BINARY_PREFIX: &str = "base64:";
 pub(crate) fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|e| format!("{BINARY_PREFIX}{}", STANDARD.encode(e.into_bytes())))
+}
+
+/// Renders a decimal with every digit of the scale it carries.
+///
+/// `BigDecimal`'s own `Display` takes two shortcuts that rewrite the stored value:
+/// it switches to exponential notation past five leading zeros (`0.0000001` prints
+/// as `1E-7`) and it drops the scale of zero (`0.00` prints as `0`). Naming an
+/// explicit precision disables both, because `bigdecimal` only reaches either
+/// shortcut when the formatter carries no precision, and pads out to the precision
+/// it is given otherwise.
+///
+/// A negative scale means the digits end above the decimal point (`1E+2`), so there
+/// is no fractional part to print and precision `0` is the faithful rendering.
+fn decimal_to_string(value: &BigDecimal) -> String {
+    let scale = usize::try_from(value.fractional_digit_count()).unwrap_or(0);
+    format!("{value:.scale$}")
+}
+
+/// Renders a MySQL `TIME` in the text form the server itself prints.
+///
+/// `MySqlTime`'s `Display` is not that form. It leaves the hours unpadded, and — called
+/// without a precision, as `to_string` does — it strips the trailing zeros of the
+/// fractional part and omits the fraction altogether when it is zero. A `TIME(6)`
+/// holding `00:00:00.500000` prints as `0:00:00.5`, and one holding `00:00:00.000000`
+/// as `0:00:00`.
+///
+/// The hours pad to a *minimum* of two digits, never a fixed two: the range reaches
+/// `838:59:59`. A nonzero fraction is padded to six digits, which is exact for `TIME(6)`.
+/// The column's declared fractional precision is not part of the row metadata, so it
+/// cannot be honoured in general: a `TIME(3)` holding `.500` still renders `.500000`, and
+/// a stored zero fraction — indistinguishable here from a `TIME(0)` value — is dropped
+/// rather than guessed, leaving `00:00:00` where a `TIME(6)` column prints
+/// `00:00:00.000000`. Those two are the only remaining departures.
+///
+/// The sign is read from `is_positive`, not `is_negative`: in sqlx 0.9.0 the latter
+/// returns `self.sign.is_positive()` and so answers the opposite of its name.
+fn mysql_time_to_string(value: &MySqlTime) -> String {
+    let sign = if value.is_positive() { "" } else { "-" };
+    let (hours, minutes, seconds) = (value.hours(), value.minutes(), value.seconds());
+    match value.microseconds() {
+        0 => format!("{sign}{hours:02}:{minutes:02}:{seconds:02}"),
+        micros => format!("{sign}{hours:02}:{minutes:02}:{seconds:02}.{micros:06}"),
+    }
 }
 
 /// Decodes `$row`'s cell at `$index` as `$ty` and renders it with [`Display`](std::fmt::Display).
@@ -91,7 +140,10 @@ impl CellDecode for sqlx::mysql::MySqlRow {
             "BIGINT UNSIGNED" | "BIT" => render!(self, index, u64),
             "FLOAT" => render!(self, index, f32),
             "DOUBLE" => render!(self, index, f64),
-            "DECIMAL" => render!(self, index, Decimal),
+            // A MySQL DECIMAL carries up to 65 significant digits, more than a 96-bit
+            // mantissa holds. `rust_decimal` fails or silently rounds such values; a
+            // `BigDecimal` is unbounded and reproduces the text form exactly.
+            "DECIMAL" => decimal_to_string(&self.try_get::<BigDecimal, _>(index)?),
             "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" => {
                 render!(self, index, String)
             }
@@ -103,7 +155,10 @@ impl CellDecode for sqlx::mysql::MySqlRow {
             "DATETIME" => render!(self, index, chrono::NaiveDateTime),
             "TIMESTAMP" => render!(self, index, chrono::DateTime<chrono::Utc>),
             "DATE" => render!(self, index, chrono::NaiveDate),
-            "TIME" => render!(self, index, chrono::NaiveTime),
+            // A MySQL TIME is a signed elapsed time over -838:59:59..=838:59:59, not a
+            // time of day, so `chrono::NaiveTime` rejects most of the range and fails the
+            // whole query.
+            "TIME" => mysql_time_to_string(&self.try_get::<MySqlTime, _>(index)?),
             "JSON" => render!(self, index, JsonValue),
             "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
                 bytes_to_string(self.try_get::<Vec<u8>, _>(index)?)
@@ -119,7 +174,7 @@ impl CellDecode for sqlx::mysql::MySqlRow {
 /// A domain reports its own name (`information_schema` is built on `sql_identifier`,
 /// `character_data`, and friends), but sqlx type-checks it by the base type's OID.
 /// Matching on the domain's name would therefore reject values that decode fine.
-fn pg_base_type(info: &sqlx::postgres::PgTypeInfo) -> &sqlx::postgres::PgTypeInfo {
+fn pg_base_type(info: &PgTypeInfo) -> &PgTypeInfo {
     let mut current = info;
     while let sqlx::postgres::PgTypeKind::Domain(base) = current.kind() {
         current = base;
@@ -151,7 +206,7 @@ impl CellDecode for sqlx::postgres::PgRow {
             "INT8" => render!(self, index, i64),
             "FLOAT4" => render!(self, index, f32),
             "FLOAT8" => render!(self, index, f64),
-            "NUMERIC" => render!(self, index, Decimal),
+            "NUMERIC" => decimal_to_string(&self.try_get::<PgNumeric, _>(index)?.0),
             "TEXT" | "VARCHAR" | "CHAR" | "NAME" | "UNKNOWN" => render!(self, index, String),
             "TIMESTAMP" => render!(self, index, chrono::NaiveDateTime),
             "TIMESTAMPTZ" => render!(self, index, chrono::DateTime<chrono::Utc>),
@@ -214,6 +269,30 @@ mod tests {
     #[test]
     fn bytes_to_string_base64_encodes_non_utf8_bytes() {
         assert_eq!(bytes_to_string(vec![0xFF, 0xFE, 0xFD]), "base64://79");
+    }
+
+    #[test]
+    fn decimal_to_string_spells_out_values_below_the_exponential_threshold() {
+        let value: BigDecimal = "0.0000001".parse().expect("valid decimal literal");
+        assert_eq!(decimal_to_string(&value), "0.0000001");
+    }
+
+    #[test]
+    fn decimal_to_string_keeps_the_scale_of_zero() {
+        let value: BigDecimal = "0.00".parse().expect("valid decimal literal");
+        assert_eq!(decimal_to_string(&value), "0.00");
+    }
+
+    #[test]
+    fn decimal_to_string_keeps_the_scale_of_an_ordinary_value() {
+        let value: BigDecimal = "1234.56".parse().expect("valid decimal literal");
+        assert_eq!(decimal_to_string(&value), "1234.56");
+    }
+
+    #[test]
+    fn decimal_to_string_renders_a_negative_scale_as_a_whole_number() {
+        let value: BigDecimal = "1E+2".parse().expect("valid decimal literal");
+        assert_eq!(decimal_to_string(&value), "100");
     }
 
     #[test]

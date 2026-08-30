@@ -125,6 +125,67 @@ async fn floating_point_and_numeric_types_decode() {
 
 #[tokio::test]
 #[ignore = "requires a container runtime; run with `just test-db`"]
+async fn numeric_columns_decode_without_precision_loss() {
+    let (_container, db) = start_postgres().await;
+
+    db.execute_sql(
+        "CREATE TABLE precise_amounts (id INTEGER PRIMARY KEY, amount NUMERIC(65,30) NOT NULL)",
+    )
+    .await
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO precise_amounts (id, amount) VALUES \
+         (1, 12345678901234567890123456789012345.123456789012345678901234567890)",
+    )
+    .await
+    .unwrap();
+
+    let result =
+        db.fetch_streaming("SELECT amount FROM precise_amounts ORDER BY id", 100).await.unwrap();
+
+    // PostgreSQL NUMERIC carries far more significant digits than the 96-bit mantissa
+    // of a fixed-width decimal, whose parser rounds the excess away without reporting
+    // an error — the value comes back altered rather than failing.
+    assert_eq!(
+        cell(&result.rows, 0, 0),
+        Some("12345678901234567890123456789012345.123456789012345678901234567890")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
+async fn numeric_columns_spell_out_every_digit_of_their_scale() {
+    let (_container, db) = start_postgres().await;
+
+    db.execute_sql(
+        "CREATE TABLE scaled_amounts (id INTEGER PRIMARY KEY, tiny NUMERIC(20,10), amount NUMERIC(10,2))",
+    )
+    .await
+    .unwrap();
+    db.execute_sql(
+        "INSERT INTO scaled_amounts (id, tiny, amount) VALUES \
+         (1, 0.0000001, 0.00), (2, 0.0000000001, 1234.56)",
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .fetch_streaming("SELECT tiny, amount FROM scaled_amounts ORDER BY id", 100)
+        .await
+        .unwrap();
+
+    // PostgreSQL coerces a NUMERIC to its declared scale, so these are the digits the
+    // server holds; a value below 1e-6 must still be spelled out rather than
+    // exponentiated.
+    assert_eq!(cell(&result.rows, 0, 0), Some("0.0000001000"));
+    assert_eq!(cell(&result.rows, 1, 0), Some("0.0000000001"));
+    // Zero carries the column's scale exactly like every other value stored in it.
+    assert_eq!(cell(&result.rows, 0, 1), Some("0.00"));
+    assert_eq!(cell(&result.rows, 1, 1), Some("1234.56"));
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
 async fn boolean_and_text_types_decode() {
     let (_container, db) = start_postgres().await;
 
