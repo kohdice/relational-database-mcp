@@ -9,7 +9,7 @@ use std::fmt;
 use futures_util::TryStreamExt;
 use schemars::JsonSchema;
 use serde::Serialize;
-use sqlx::{AssertSqlSafe, Row};
+use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
 
 use crate::decode::{CellDecode, bytes_to_string, column_names, decode_row};
 use crate::error::AppError;
@@ -284,8 +284,9 @@ impl fmt::Display for ValidatedTableName {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct QueryResult {
     /// Column names, in the order the database returned them.
-    /// Empty when the query produced no rows, because column metadata is
-    /// only available from a returned row.
+    /// [`DatabaseConnection::fetch_streaming`] always reports them, but
+    /// [`DatabaseConnection::describe_table`] leaves them empty when its catalog query
+    /// matched no rows to carry them — that is, when the table does not exist.
     pub columns: Vec<String>,
     /// Each row holds one decoded value per column; `None` represents SQL NULL.
     pub rows: Vec<Vec<Option<String>>>,
@@ -319,8 +320,12 @@ fn rows_to_query_result<R: CellDecode>(
     rows: &[R],
     truncated: bool,
 ) -> Result<QueryResult, sqlx::Error> {
-    // Column metadata is carried by the rows themselves, so an empty
-    // result set cannot report which columns the query selected.
+    // `fetch_streaming` recovers the column names of an empty result by preparing the
+    // statement, but this function is handed rows that were already fetched and holds no
+    // pool to prepare on, so there is nothing left to read the names from. The gap is
+    // unobservable: the only callers are the `describe_table` catalog queries, where an
+    // empty result means the table does not exist and the tool reports it as not found
+    // without reading `columns`.
     let Some(first) = rows.first() else {
         return Ok(QueryResult::new(Vec::new(), Vec::new(), truncated));
     };
@@ -388,6 +393,9 @@ impl DatabaseConnection {
     /// Each row is decoded as it arrives and the raw row is then dropped, so the raw
     /// and decoded representations never occupy memory at the same time.
     ///
+    /// `columns` reports the query's column names even when no row is kept — because
+    /// the result set is empty, or because `max_rows` is 0.
+    ///
     /// `sql` is wrapped in [`AssertSqlSafe`] because running caller-supplied SQL is the
     /// purpose of this server; injection is not a meaningful threat here.
     /// [`crate::sql::is_read_query`] does not gate this call: it only picks the response
@@ -406,23 +414,36 @@ impl DatabaseConnection {
         max_rows: usize,
     ) -> Result<QueryResult, sqlx::Error> {
         with_pool!(&self.pool, |pool| {
-            let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(pool);
+            // The prepare fallback below must observe the same connection-local state as
+            // the query itself — temporary tables, PostgreSQL's `search_path`, SQLite's
+            // per-connection in-memory databases — so both run on one acquired connection.
+            let mut conn = pool.acquire().await?;
+            let mut stream = sqlx::query(AssertSqlSafe(sql)).fetch(&mut *conn);
             let mut columns: Vec<String> = Vec::new();
             let mut rows: Vec<Vec<Option<String>>> = Vec::new();
             let mut truncated = false;
             while let Some(row) = stream.try_next().await? {
+                // Capturing before the limit check is what lets `max_rows` of 0 report
+                // column names without the fallback below.
+                if columns.is_empty() {
+                    columns = column_names(&row);
+                }
                 if rows.len() == max_rows {
                     // Reading one row past the limit is what distinguishes a result
                     // that was cut short from one that merely ends at the limit.
                     truncated = true;
                     break;
                 }
-                if columns.is_empty() {
-                    columns = column_names(&row);
-                }
                 rows.push(decode_row(&row)?);
             }
             drop(stream);
+            if columns.is_empty() {
+                // No row arrived, so nothing carried the column metadata. Preparing the
+                // statement exposes it without executing the query again; the round trip
+                // is paid only on this path.
+                let statement = (&mut *conn).prepare(AssertSqlSafe(sql).into_sql_str()).await?;
+                columns = statement.columns().iter().map(|c| c.name().to_string()).collect();
+            }
             Ok(QueryResult::new(columns, rows, truncated))
         })
     }

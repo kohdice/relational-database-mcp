@@ -7,8 +7,9 @@ use sqlx::pool::PoolOptions;
 // fixture helper in an integration test file needs the exemption spelled out.
 #[expect(clippy::unwrap_used, reason = "test fixture: a failed setup should abort the test")]
 async fn setup_db() -> DatabaseConnection {
-    // max_connections(1): SQLite :memory: creates a separate DB per connection.
-    // Restricting to 1 connection ensures all operations share the same DB.
+    // max_connections(1) is belt-and-braces, not a correctness requirement: sqlx maps
+    // `sqlite::memory:` to one shared-cache database per pool, so every connection of this
+    // pool would see the same schema anyway.
     let pool = PoolOptions::<sqlx::Sqlite>::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -30,6 +31,59 @@ async fn setup_db() -> DatabaseConnection {
         .unwrap();
 
     db
+}
+
+/// Waits until the pool holds at least `expected` idle connections.
+///
+/// `PoolConnection`'s `Drop` hands the connection back through a spawned task, so the
+/// idle queue only settles once that task has run.
+async fn wait_for_idle(pool: &sqlx::SqlitePool, expected: usize) {
+    for _ in 0..1000 {
+        if pool.num_idle() >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("pool never returned {expected} connections to its idle queue");
+}
+
+/// Builds a two-connection pool whose connections disagree about the schema of table `t`,
+/// so that the column names a query reports identify which connection answered it.
+///
+/// `cache=private` is what makes the two connections diverge: sqlx opens `sqlite::memory:`
+/// with a shared cache, so every pooled connection would otherwise see one database. The
+/// pool's idle queue is FIFO, so releasing the connection carrying `from_query_connection`
+/// first makes it the one the next query runs on, leaving the other as the connection a
+/// pool-level fallback would reach for instead.
+#[expect(clippy::unwrap_used, reason = "test fixture: a failed setup should abort the test")]
+async fn setup_divergent_schema_pool() -> sqlx::SqlitePool {
+    let pool = PoolOptions::<sqlx::Sqlite>::new()
+        .max_connections(2)
+        .connect("sqlite://?mode=memory&cache=private")
+        .await
+        .unwrap();
+
+    let mut queried = pool.acquire().await.unwrap();
+    let mut other = pool.acquire().await.unwrap();
+    sqlx::query("CREATE TABLE t (from_query_connection INTEGER)")
+        .execute(&mut *queried)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (from_query_connection) VALUES (1)")
+        .execute(&mut *queried)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE t (from_other_connection INTEGER)")
+        .execute(&mut *other)
+        .await
+        .unwrap();
+
+    drop(queried);
+    wait_for_idle(&pool, 1).await;
+    drop(other);
+    wait_for_idle(&pool, 2).await;
+
+    pool
 }
 
 /// Convenience for asserting on a single cell without repeating the Option/&str dance.
@@ -140,8 +194,7 @@ async fn test_fetch_streaming_empty_result() {
     assert!(result.is_empty());
     assert_eq!(result.row_count, 0);
     assert!(result.rows.is_empty());
-    // Column metadata comes from the returned rows, so an empty result set has none.
-    assert!(result.columns.is_empty());
+    assert_eq!(result.columns, vec!["id", "name", "email"]);
 }
 
 #[tokio::test]
@@ -201,8 +254,28 @@ async fn test_fetch_streaming_zero_max_rows_returns_no_rows() {
 
     assert_eq!(result.row_count, 0);
     assert!(result.truncated, "rows exist beyond a zero limit");
-    // Column metadata comes from a kept row, so a zero limit reports none.
-    assert!(result.columns.is_empty());
+    assert_eq!(result.columns, vec!["id"]);
+}
+
+#[tokio::test]
+async fn test_fetch_streaming_empty_result_reports_the_query_connection_columns() {
+    let db = DatabaseConnection::from_sqlite_pool(setup_divergent_schema_pool().await);
+
+    let result = db.fetch_streaming("SELECT * FROM t LIMIT 0", 100).await.unwrap();
+
+    assert!(result.rows.is_empty());
+    assert_eq!(result.columns, vec!["from_query_connection"]);
+}
+
+#[tokio::test]
+async fn test_fetch_streaming_zero_max_rows_reports_the_query_connection_columns() {
+    let db = DatabaseConnection::from_sqlite_pool(setup_divergent_schema_pool().await);
+
+    let result = db.fetch_streaming("SELECT * FROM t", 0).await.unwrap();
+
+    assert_eq!(result.row_count, 0);
+    assert!(result.truncated, "a row exists beyond a zero limit");
+    assert_eq!(result.columns, vec!["from_query_connection"]);
 }
 
 #[tokio::test]

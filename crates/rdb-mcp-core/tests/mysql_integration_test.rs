@@ -480,6 +480,27 @@ async fn fetch_streaming_truncates_at_max_rows() {
 
 #[tokio::test]
 #[ignore = "requires a container runtime; run with `just test-db`"]
+async fn empty_result_reports_column_names() {
+    let fixture = start_mysql().await;
+    let db = &fixture.db;
+
+    db.execute_sql("CREATE TABLE numbers (id INT PRIMARY KEY, label VARCHAR(16) NOT NULL)")
+        .await
+        .unwrap();
+    db.execute_sql("INSERT INTO numbers (id, label) VALUES (1, 'one')").await.unwrap();
+
+    let result =
+        db.fetch_streaming("SELECT id, label FROM numbers WHERE id = 999", 100).await.unwrap();
+
+    // No row reaches the decoder, so these names can only come from the prepared
+    // statement the empty-result path falls back to.
+    assert_eq!(result.columns, vec!["id", "label"]);
+    assert_eq!(result.row_count, 0);
+    assert!(result.rows.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires a container runtime; run with `just test-db`"]
 async fn caching_sha2_password_user_connects_without_tls() {
     let fixture = start_mysql().await;
     let db = &fixture.db;
