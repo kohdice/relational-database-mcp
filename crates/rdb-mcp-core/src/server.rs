@@ -63,6 +63,7 @@ pub struct DescribeTableParams {
 /// by the `kind` field so that a single output schema covers both.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[schemars(extend("type" = "object"))]
 pub enum ExecuteSqlResult {
     /// The statement was a read query and returned a result set.
     Query(QueryResult),
